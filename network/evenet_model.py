@@ -6,6 +6,7 @@ from evenet.network.layers.utils import RandomDrop
 
 from evenet.network.body.normalizer import Normalizer
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
+from evenet.network.body.grouped_sequential_embedding import GroupedSequentialEmbedding
 from evenet.network.body.object_encoder import ObjectEncoder
 from evenet.network.heads.classification.classification_head import ClassificationHead, RegressionHead
 from evenet.network.heads.assignment.assignment_head import SharedAssignmentHead
@@ -51,6 +52,7 @@ class EveNetModel(nn.Module):
         self.include_assignment = assignment
         self.include_segmentation = segmentation
         self.device = device
+        self.grouped_sequential_cfg = self.event_info.grouped_sequential_config
 
         # self.normalization_dict = normalization_dict
 
@@ -85,7 +87,8 @@ class EveNetModel(nn.Module):
         )
 
         self.global_input_dim: int = global_normalizer_info["norm_mask"].size()[-1]
-        self.sequential_input_dim: int = input_normalizers_setting["SEQUENTIAL"]["norm_mask"].size()[-1]
+        self.raw_sequential_input_dim: int = input_normalizers_setting["SEQUENTIAL"]["norm_mask"].size()[-1]
+        self.sequential_input_dim: int = self.event_info.projected_sequential_input_dim
         self.local_feature_indices = self.network_cfg.Body.PET.local_point_index
 
         self.sequential_normalizer = Normalizer(
@@ -100,6 +103,16 @@ class EveNetModel(nn.Module):
             mean=global_normalizer_info["mean"].to(self.device),
             std=global_normalizer_info["std"].to(self.device),
         )
+
+        grouped_embedding_cfg = self.network_cfg.Body.get("GroupedSequentialEmbedding", {})
+        self.GroupedSequentialEmbedding = None
+        if self.grouped_sequential_cfg is not None:
+            self.GroupedSequentialEmbedding = GroupedSequentialEmbedding(
+                raw_feature_names=list(self.event_info.raw_sequential_feature_names),
+                grouped_config=self.grouped_sequential_cfg,
+                hidden_dim_scale=grouped_embedding_cfg.get("hidden_dim_scale", 2.0),
+                dropout=grouped_embedding_cfg.get("dropout", 0.0),
+            )
 
         if self.include_point_cloud_generation:
             self.num_point_cloud_normalizer = Normalizer(
@@ -317,6 +330,15 @@ class EveNetModel(nn.Module):
             ("deterministic", self.include_classification or self.include_assignment or self.include_regression or self.include_segmentation),
         ]
 
+    def project_sequential_inputs(self, x: Tensor, mask: Tensor) -> Tensor:
+        """
+        Convert normalized raw sequential inputs [B, N, F_raw] into the projected
+        PET basis [B, N, F_projected] when grouped inputs are enabled.
+        """
+        if self.GroupedSequentialEmbedding is None:
+            return x
+        return self.GroupedSequentialEmbedding(x=x, mask=mask)
+
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,
             progressive_params: dict = None,
@@ -363,7 +385,7 @@ class EveNetModel(nn.Module):
 
         _, alpha, _ = get_logsnr_alpha_sigma(time)
 
-        input_point_cloud = x['x']
+        input_point_cloud_raw = x['x']
         input_point_cloud_mask = x['x_mask'].unsqueeze(-1)
         global_conditions = x['conditions'].unsqueeze(1)  # (batch_size, 1, num_conditions)
         global_conditions_mask = x['conditions_mask'].unsqueeze(-1)  # (batch_size, 1, 1)
@@ -375,7 +397,8 @@ class EveNetModel(nn.Module):
         if self.include_global_generation or self.include_point_cloud_generation:
             num_point_cloud = x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
 
-        B, _, num_features = input_point_cloud.shape
+        B = input_point_cloud_raw.shape[0]
+        num_features = self.sequential_input_dim
         if 'x_invisible' in x and self.include_neutrino_generation:
             invisible_point_cloud = x['x_invisible']
             pad_size = self.invisible_padding
@@ -383,7 +406,7 @@ class EveNetModel(nn.Module):
             # Pad invisible features to match input
             invisible_point_cloud = F.pad(invisible_point_cloud, (0, pad_size), value=0.0)
         else:
-            invisible_point_cloud = torch.zeros(B, 1, num_features, device=input_point_cloud.device)
+            invisible_point_cloud = torch.zeros(B, 1, num_features, device=input_point_cloud_raw.device)
 
         invisible_point_cloud_mask = x['x_invisible_mask'].unsqueeze(
             -1) if 'x_invisible_mask' in x else torch.zeros_like(input_point_cloud_mask[:, [0], :]).bool()
@@ -408,8 +431,14 @@ class EveNetModel(nn.Module):
         ## Input normalization ##
         #########################
 
-        input_point_cloud = self.sequential_normalizer(
-            x=input_point_cloud,
+        input_point_cloud_raw = self.sequential_normalizer(
+            x=input_point_cloud_raw,
+            mask=input_point_cloud_mask,
+        )
+
+
+        input_point_cloud = self.project_sequential_inputs(
+            x=input_point_cloud_raw,
             mask=input_point_cloud_mask,
         )
 
@@ -739,11 +768,15 @@ class EveNetModel(nn.Module):
             class_label = cond_x['classification'].unsqueeze(-1) if 'classification' in cond_x else torch.zeros_like(
                 cond_x['conditions_mask']).long()  # (batch_size, 1)
             # num_point_cloud = cond_x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
-            input_point_cloud = cond_x['x']
+            input_point_cloud_raw = cond_x['x']
             input_point_cloud_mask = cond_x['x_mask'].unsqueeze(-1)
 
-            input_point_cloud = self.sequential_normalizer(
-                x=input_point_cloud,
+            input_point_cloud_raw = self.sequential_normalizer(
+                x=input_point_cloud_raw,
+                mask=input_point_cloud_mask,
+            )
+            input_point_cloud = self.project_sequential_inputs(
+                x=input_point_cloud_raw,
                 mask=input_point_cloud_mask,
             )
 

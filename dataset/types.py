@@ -137,6 +137,7 @@ class SpecialKey(str, Enum):
     Mask = "MASK"
     Event = "EVENT"
     Inputs = "INPUTS"
+    GroupedInputs = "GROUPED_INPUTS"
     Targets = "TARGETS"
     Particle = "PARTICLE"
     Segmentations = "SEGMENTATIONS"
