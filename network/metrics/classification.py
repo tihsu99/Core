@@ -175,11 +175,13 @@ class ClassificationMetrics:
         # Use training store if provided, else default to self.hist_store
         train_hist_store = self.train_hist_store if self.train_hist_store is not None else self.hist_store
 
-        # Custom color palette (max 10 classes)
-        colors = [
-            "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
-            "#CD5582", "#E1BE6A", "#E1BE6A", "#E89A7A", "#EC6B2D"
-        ]
+        cmap = plt.cm.get_cmap("tab20", max(self.num_classes, 1))
+        colors = [mcolors.to_hex(cmap(index)) for index in range(max(self.num_classes, 1))]
+
+        def class_label(index: int):
+            if class_names is None or index >= len(class_names):
+                return index
+            return class_names[index]
 
         bin_centers = 0.5 * (self.bins[1:] + self.bins[:-1])
         bin_widths = np.diff(self.bins)
@@ -193,7 +195,7 @@ class ClassificationMetrics:
                 if np.sum(train_counts) > 0:
                     train_density = train_counts / (np.sum(train_counts) * bin_widths)
                     color = colors[cls % len(colors)]
-                    label = f"{class_names[cls]} (True, Train)" if cls == true_cls else f"{class_names[cls]} (Train)"
+                    label = f"{class_label(cls)} (True, Train)" if cls == true_cls else f"{class_label(cls)} (Train)"
 
                     if cls == true_cls:
                         plt.bar(bin_centers, train_density, width=bin_widths, color=color, alpha=0.85, label=None,
@@ -207,7 +209,7 @@ class ClassificationMetrics:
                 if np.sum(val_counts) > 0:
                     val_density = val_counts / (np.sum(val_counts) * bin_widths)
                     color = colors[cls % len(colors)]
-                    label = f"{class_names[cls]} (True)" if cls == true_cls else f"{class_names[cls]}"
+                    label = f"{class_label(cls)} (True)" if cls == true_cls else f"{class_label(cls)}"
                     plt.plot(
                         bin_centers, val_density,
                         color=color,
@@ -218,7 +220,7 @@ class ClassificationMetrics:
                         markersize=6 if cls == true_cls else 4,
                     )
 
-            title = f"True Class {class_names[true_cls] if class_names else true_cls}"
+            title = f"True Class {class_label(true_cls)}"
             plt.title(f"{title}: Softmax Score Distribution (Train vs Val)")
             plt.xlabel("Softmax Score")
             plt.ylabel("Density")
@@ -269,15 +271,16 @@ class ClassificationMetrics:
             auc_valid = auc(fpr_valid, tpr_valid)
             auc_scores_valid[target_cls] = auc_valid
 
-            plt.plot(fpr, tpr, color=colors[target_cls], lw=2, label=f"AUC = {roc_auc:.3f}")
-            plt.plot(fpr_valid, tpr_valid, '--', color=colors[target_cls], lw=2, label=f"AUC[valid] = {auc_valid:.3f}")
+            color = colors[target_cls % len(colors)]
+            plt.plot(fpr, tpr, color=color, lw=2, label=f"AUC = {roc_auc:.3f}")
+            plt.plot(fpr_valid, tpr_valid, '--', color=color, lw=2, label=f"AUC[valid] = {auc_valid:.3f}")
             plt.plot([0, 1], [0, 1], 'k--', lw=1)
             plt.xlim([0.0, 1.0])
             plt.ylim([0.0, 1.05])
             plt.grid(True)
             plt.xlabel("False Positive Rate")
             plt.ylabel("True Positive Rate")
-            plt.title(f"ROC Curve: {class_names[target_cls]}")
+            plt.title(f"ROC Curve: {class_label(target_cls)}")
             plt.legend(loc="lower right")
             plt.tight_layout()
 
