@@ -93,14 +93,14 @@ class ObjectTagEmbeddingLogger:
 
         with torch.no_grad():
             x = batch["x"].to(device=model.device)
-            mask = batch["x_mask"].to(device=model.device).unsqueeze(-1)
+            valid_mask = batch["x_mask"].to(device=model.device, dtype=torch.bool)
+            mask = valid_mask.unsqueeze(-1)
 
             normalized_x = model.sequential_normalizer(x=x, mask=mask)
             projected_x = model.project_sequential_inputs(x=normalized_x, mask=mask)
 
-            valid_mask = batch["x_mask"].bool()
-            object_tag = projected_x[..., list(self._object_tag_indices)].detach().cpu()[valid_mask]
-            pdg_id = batch["x"][..., self._label_feature_index].detach().cpu()[valid_mask]
+            object_tag = projected_x[..., list(self._object_tag_indices)][valid_mask].detach().cpu()
+            pdg_id = x[..., self._label_feature_index][valid_mask].detach().cpu()
 
             if object_tag.numel() == 0:
                 return
