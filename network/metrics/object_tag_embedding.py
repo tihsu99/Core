@@ -18,6 +18,8 @@ class ObjectTagEmbeddingConfig:
     log_every_n_epochs: int = 1
     alpha: float = 0.5
     marker_size: float = 8.0
+    outlier_percentile_low: float = 0.5
+    outlier_percentile_high: float = 99.5
     interested_labels: dict[int, str] | None = None
     others_label: str = "others"
 
@@ -37,6 +39,8 @@ class ObjectTagEmbeddingConfig:
             log_every_n_epochs=int(raw_cfg.get("log_every_n_epochs", 1)),
             alpha=float(raw_cfg.get("alpha", 0.5)),
             marker_size=float(raw_cfg.get("marker_size", 8.0)),
+            outlier_percentile_low=float(raw_cfg.get("outlier_percentile_low", 0.5)),
+            outlier_percentile_high=float(raw_cfg.get("outlier_percentile_high", 99.5)),
             interested_labels=interested_labels,
             others_label=str(raw_cfg.get("others_label", "others")),
         )
@@ -133,6 +137,21 @@ class ObjectTagEmbeddingLogger:
 
         return reduced.numpy(), labels.numpy()
 
+    def _filter_plot_outliers(self, points: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        low = self.config.outlier_percentile_low
+        high = self.config.outlier_percentile_high
+        if points.shape[0] == 0 or not (0.0 <= low < high <= 100.0):
+            return points, labels
+
+        lower = np.percentile(points, low, axis=0)
+        upper = np.percentile(points, high, axis=0)
+        keep_mask = np.all((points >= lower) & (points <= upper), axis=1)
+
+        # Avoid dropping everything if the sampled cloud is too small or degenerate.
+        if not np.any(keep_mask):
+            return points, labels
+        return points[keep_mask], labels[keep_mask]
+
     def _label_name(self, pdg_id: int) -> str:
         pdg_id = abs(int(pdg_id))
         if self.config.interested_labels is None:
@@ -180,6 +199,7 @@ class ObjectTagEmbeddingLogger:
             return
 
         points, labels = prepared
+        points, labels = self._filter_plot_outliers(points, labels)
         if points.shape[0] == 0:
             self.reset()
             return
