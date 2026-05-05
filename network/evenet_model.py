@@ -422,10 +422,11 @@ class EveNetModel(nn.Module):
             num_point_cloud = x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
 
         B = input_point_cloud_raw.shape[0]
-        if 'x_invisible' in x and self.include_neutrino_generation:
-            invisible_point_cloud = x['x_invisible']
-        else:
-            invisible_point_cloud = torch.zeros(B, 1, self.invisible_input_dim, device=input_point_cloud_raw.device)
+        if self.include_neutrino_generation:
+            if 'x_invisible' in x:
+                invisible_point_cloud = x['x_invisible']
+            else:
+                invisible_point_cloud = torch.zeros(B, 1, self.invisible_input_dim, device=input_point_cloud_raw.device)
 
         invisible_point_cloud_mask = x['x_invisible_mask'].unsqueeze(
             -1) if 'x_invisible_mask' in x else torch.zeros_like(input_point_cloud_mask[:, [0], :]).bool()

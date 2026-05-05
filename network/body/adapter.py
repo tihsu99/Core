@@ -9,7 +9,7 @@ class Adapter(nn.Module):
         self.up   = nn.Linear(bottleneck, d_model, bias=False)
         self.drop = nn.Dropout(dropout)
 
-        # 讓一開始 adapter ≈ identity（更穩）
+        # Initialize the adapter close to identity for stability.
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x):
