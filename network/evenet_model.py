@@ -160,6 +160,9 @@ class EveNetModel(nn.Module):
         # [1] Body
         pet_config = self.network_cfg.Body.PET
         pair_input_dim = self.PairCreator.output_dim if self.enable_pair_creator else 0
+        num_local_transformers = pet_config.get("num_local_transformers", None)
+        if num_local_transformers is None:
+            num_local_transformers = pet_config.num_local_layer
         self.PET = PETBody(
             num_feat=self.sequential_input_dim,
             num_keep=pet_config.num_feature_keep,
@@ -167,7 +170,7 @@ class EveNetModel(nn.Module):
             projection_dim=pet_config.hidden_dim,
             local=pet_config.enable_local_embedding,
             K=pet_config.local_Krank,
-            num_local=pet_config.num_local_layer,
+            num_local=num_local_transformers,
             num_layers=pet_config.num_layers,
             num_heads=pet_config.num_heads,
             drop_probability=pet_config.drop_probability,
@@ -181,6 +184,7 @@ class EveNetModel(nn.Module):
             pair_dim=pet_config.get("pair_dim", None),
             pair_num_heads=pet_config.get("pair_num_heads", None),
             use_triangle_attention=pet_config.get("use_triangle_attention", False),
+            norm_type=pet_config.get("norm_type", "DynamicTanh"),
         )
 
         # [2] Classification + Regression + Assignment Body
@@ -617,7 +621,26 @@ class EveNetModel(nn.Module):
                 mask=global_conditions_mask
             )
 
-            local_points = full_input_point_cloud[..., self.local_feature_indices]
+            if schedule_name == "generation":
+                local_point_source = self.sequential_normalizer.denormalize(
+                    x=full_input_point_cloud.clone(),
+                    mask=full_input_point_cloud_mask,
+                )
+            else:
+                local_point_padding = (
+                    full_input_point_cloud.shape[1] - raw_input_point_cloud.shape[1]
+                )
+                local_point_source = F.pad(
+                    raw_input_point_cloud,
+                    (0, 0, 0, local_point_padding),
+                )
+            local_points = local_point_source[..., self.local_feature_indices]
+            local_mask = full_input_point_cloud_mask
+            if schedule_name == "neutrino_generation":
+                local_mask = torch.cat([
+                    input_point_cloud_mask,
+                    torch.zeros_like(invisible_point_cloud_mask),
+                ], dim=1)
             full_input_point_cloud, pair_output = self.PET(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
@@ -626,7 +649,8 @@ class EveNetModel(nn.Module):
                 pair_mask=pair_mask,
                 attn_mask=full_attn_mask,
                 time=full_time,
-                time_masking=time_masking
+                time_masking=time_masking,
+                local_mask=local_mask,
             )
             if self.enable_pair_creator:
                 pair_representations[schedule_name]["output"] = pair_output
@@ -814,7 +838,10 @@ class EveNetModel(nn.Module):
                 mask=noise_mask,
                 normalized=True,
             )
-            local_points = noise_x[..., self.local_feature_indices]
+            local_points = self.sequential_normalizer.denormalize(
+                x=noise_x.clone(),
+                mask=noise_mask,
+            )[..., self.local_feature_indices]
             input_point_cloud, _ = self.PET(
                 input_features=noise_x,
                 input_points=local_points,
@@ -894,7 +921,10 @@ class EveNetModel(nn.Module):
                 normalized=False,
                 output_size=full_input_point_cloud.shape[1],
             )
-            local_points = full_input_point_cloud[..., self.local_feature_indices]
+            local_points = F.pad(
+                raw_input_point_cloud,
+                (0, 0, 0, full_input_point_cloud.shape[1] - raw_input_point_cloud.shape[1]),
+            )[..., self.local_feature_indices]
             full_input_point_cloud, _ = self.PET(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
@@ -903,7 +933,11 @@ class EveNetModel(nn.Module):
                 pair_mask=pair_mask,
                 attn_mask=full_attn_mask,
                 time=full_time,
-                time_masking=time_masking
+                time_masking=time_masking,
+                local_mask=torch.cat([
+                    input_point_cloud_mask,
+                    torch.zeros_like(invisible_point_cloud_mask),
+                ], dim=1),
             )
 
             pred_point_cloud_vector = self.TruthGeneration(

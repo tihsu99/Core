@@ -5,13 +5,21 @@ import torch
 from evenet.network.layers.utils import TalkingHeadAttention, StochasticDepth, LayerScale
 from evenet.network.layers.linear_block import GRUGate, GRUBlock
 from evenet.network.layers.activation import create_residual_connection
+from evenet.network.layers.norm import DynamicTanh
 
 from typing import Optional
 
 class TransformerBlockModule(nn.Module):
     def __init__(self, projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                 drop_probability):
+                 drop_probability, norm_type="DynamicTanh"):
         super().__init__()
+        normalized_norm_type = norm_type.lower().replace("_", "").replace(" ", "")
+        if normalized_norm_type not in ("layernorm", "dynamictanh"):
+            raise ValueError(
+                "norm_type must be 'LayerNorm' or 'DynamicTanh'."
+            )
+        normalization = nn.LayerNorm if normalized_norm_type == "layernorm" else DynamicTanh
+
         self.projection_dim = projection_dim
         self.num_heads = num_heads
         self.dropout = dropout
@@ -19,8 +27,8 @@ class TransformerBlockModule(nn.Module):
         self.layer_scale_flag = layer_scale
         self.drop_probability = drop_probability
 
-        self.norm1 = nn.LayerNorm(projection_dim)
-        self.norm2 = nn.LayerNorm(projection_dim)
+        self.norm1 = normalization(projection_dim)
+        self.norm2 = normalization(projection_dim)
 
         if talking_head:
             self.attn = TalkingHeadAttention(projection_dim, num_heads, dropout)

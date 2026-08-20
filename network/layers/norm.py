@@ -127,6 +127,37 @@ class LayerNorm(nn.Module):
         return self.normalization(x)
 
 
+class DynamicTanh(nn.Module):
+    """Learnable DyT(x) = weight * tanh(alpha * x)."""
+
+    def __init__(
+        self,
+        normalized_shape: int,
+        channels_last: bool = True,
+        alpha_init_value: float = 0.5,
+    ):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.alpha_init_value = alpha_init_value
+        self.channels_last = channels_last
+        self.alpha = nn.Parameter(torch.full((1,), alpha_init_value))
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+
+    # noinspection PyUnusedLocal
+    def forward(self, x: Tensor, sequence_mask: Optional[Tensor] = None) -> Tensor:
+        x = torch.tanh(self.alpha * x)
+        if self.channels_last:
+            return x * self.weight
+        return x * self.weight[:, None, None]
+
+    def extra_repr(self) -> str:
+        return (
+            f"normalized_shape={self.normalized_shape}, "
+            f"alpha_init_value={self.alpha_init_value}, "
+            f"channels_last={self.channels_last}"
+        )
+
+
 # noinspection SpellCheckingInspection
 def create_normalization(normalization: str, output_dim: int) -> nn.Module:
     normalization = normalization.lower().replace("_", "").replace(" ", "")

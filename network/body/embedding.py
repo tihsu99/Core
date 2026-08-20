@@ -189,35 +189,90 @@ class FourierEmbedding(nn.Module):
 
 
 class LocalEmbeddingLayer(nn.Module):
-    def __init__(self, input_dim, projection_dim, K, num_local=2):
+    """Embed fixed physical neighborhoods with local self-attention."""
+
+    def __init__(
+            self,
+            input_dim,
+            projection_dim,
+            K,
+            num_local=2,
+            num_heads=1,
+            dropout=0.0,
+            drop_probability=0.0,
+            norm_type="DynamicTanh",
+    ):
         super().__init__()
-        self.input_dim = input_dim
-        self.projection_dim = projection_dim
+        if K < 0:
+            raise ValueError(f"K must be non-negative, got {K}.")
+        if num_local < 0:
+            raise ValueError(f"num_local must be non-negative, got {num_local}.")
+
         self.K = K
-        self.num_local = num_local
-        self.local_embed_layer = nn.ModuleList([(LocalEmbeddingBlock(self.input_dim, self.projection_dim,
-                                                                     self.K) if i == 0 else LocalEmbeddingBlock(
-            self.projection_dim, self.projection_dim, self.K)) for i in range(self.num_local)])
+        self.local_embedding = LocalEmbeddingBlock(
+            input_dim=input_dim,
+            projection_dim=projection_dim,
+            K=K,
+        )
+        self.local_transformers = nn.ModuleList([
+            TransformerBlockModule(
+                projection_dim=projection_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                talking_head=False,
+                layer_scale=False,
+                layer_scale_init=1.0e-5,
+                drop_probability=drop_probability,
+                norm_type=norm_type,
+            )
+            for _ in range(num_local)
+        ])
 
-    def forward(self, x: Tensor, points: Tensor, mask: Tensor) -> Tensor:
-        """
+    def forward(
+            self,
+            x: Tensor,
+            points: Tensor,
+            mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return [B,N,D] features plus [B,N,K] KNN indices and masks."""
+        local_features, knn_indices, neighbor_mask = self.local_embedding(
+            points=points,
+            features=x,
+            mask=mask,
+        )
 
-        :param x: shape: (batch_size, num_points, input_dim)
-        :param points: shape: (batch_size, num_points, num_features)
-        :param mask: shape: (batch_size, num_points, 1)
-        :return:
-        """
-        mask = mask.to(torch.int)
-        coord_shift = 999.0 * (mask == 0).float()
-        local_features = x
-        for idx, local_embed in enumerate(self.local_embed_layer):
-            local_features = local_embed(
-                points=coord_shift + points,
-                features=local_features
-            )  # [B, T, D]
-            points = local_features  # tihsu TODO: add mask ?
+        batch_size, num_points, num_neighbors, projection_dim = local_features.shape
+        if num_neighbors == 0:
+            return (
+                local_features.new_zeros(batch_size, num_points, projection_dim),
+                knn_indices,
+                neighbor_mask,
+            )
+        # Treat each object's K neighbors as an independent sequence.
+        flat_features = local_features.reshape(-1, num_neighbors, projection_dim)  # [B*N, K, D]
+        flat_mask = neighbor_mask.reshape(-1, num_neighbors)  # [B*N, K]
+        active_rows = flat_mask.any(dim=-1)
 
-        return local_features * mask.float()
+        if active_rows.any():
+            active_features = flat_features[active_rows]
+            active_mask = flat_mask[active_rows, :, None]
+            for transformer in self.local_transformers:
+                active_features = transformer(active_features, active_mask)
+            flat_features = flat_features.index_copy(
+                0,
+                active_rows.nonzero(as_tuple=False).squeeze(-1),
+                active_features,
+            )
+
+        local_features = flat_features.reshape(
+            batch_size, num_points, num_neighbors, projection_dim
+        )
+        neighbor_weight = neighbor_mask[..., None].to(local_features.dtype)
+        local_features = (local_features * neighbor_weight).sum(dim=2)
+        local_features = local_features / neighbor_weight.sum(dim=2).clamp_min(1.0)
+        local_features = local_features * mask.bool().to(local_features.dtype)
+
+        return local_features, knn_indices, neighbor_mask
 
 
 class LocalEmbeddingBlock(nn.Module):
@@ -227,42 +282,75 @@ class LocalEmbeddingBlock(nn.Module):
         self.input_dim = input_dim
         self.projection_dim = projection_dim
         self.mlp = nn.Sequential(
-            nn.Linear(2 * self.input_dim, 2 * self.projection_dim),
+            nn.Linear(self.input_dim, 2 * self.projection_dim),
             nn.GELU(approximate='none'),
             nn.Linear(2 * self.projection_dim, self.projection_dim),
             nn.GELU(approximate='none')
         )
 
-    def pairwise_distance(self, points):
-        r = torch.sum(points * points, dim=2, keepdim=True)  # [B, T, D]
-        m = torch.bmm(points, points.transpose(1, 2))  # [B, T, D] x [B, D, T] -> [B, T, T]
-        D = r - 2 * m + r.transpose(1, 2) + 1e-5
-        return D
+    @staticmethod
+    def pairwise_distance(points):
+        r = torch.sum(points * points, dim=2, keepdim=True)  # [B, N, 1]
+        m = torch.bmm(points, points.transpose(1, 2))  # [B, N, P] x [B, P, N]
+        return (r - 2 * m + r.transpose(1, 2)).clamp_min(0.0)
 
-    def forward(self, points, features):
-        distances = self.pairwise_distance(points)  # uses custom pairwise function, not torch.cdist
-        _, indices = torch.topk(-distances, k=self.K + 1, dim=-1)
-        indices = indices[:, :, 1:]  # Exclude self
-        # indices Shape: (N, P, 10)
+    def find_knn(self, points: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        """Find up to K valid non-self neighbors in physical coordinate space."""
+        if points.ndim != 3 or mask.ndim != 3 or mask.shape[-1] != 1:
+            raise ValueError("Expected points [B, N, D] and mask [B, N, 1].")
+        if points.shape[:2] != mask.shape[:2]:
+            raise ValueError("points and mask must share their [B, N] dimensions.")
 
-        batch_size, num_points, _ = features.shape
-        batch_indices = torch.arange(batch_size, device=features.device).view(-1, 1, 1)
-        batch_indices = batch_indices.repeat(1, num_points, self.K)
-        indices = torch.stack([batch_indices, indices], dim=-1)
-        # concat indices torch.Size([N, P, K, 2])
+        batch_size, num_points, _ = points.shape
+        num_neighbors = min(self.K, max(num_points - 1, 0))
+        if num_neighbors == 0:
+            empty_shape = (batch_size, num_points, 0)
+            return (
+                torch.empty(empty_shape, dtype=torch.long, device=points.device),
+                torch.empty(empty_shape, dtype=torch.bool, device=points.device),
+            )
 
-        # Gather neighbor features
-        neighbors = features[
-            indices[:, :, :, 0], indices[:, :, :, 1]]  # Shape: (N, P, K, C) | neighbors: torch.Size([64, 150, 10, 13])
-        knn_fts_center = features.unsqueeze(2).expand_as(
-            neighbors)  # Shape: (N, P, K, C) | knn fts center: torch.Size([64, 150, 10, 13])
-        local_features = torch.cat([neighbors - knn_fts_center, knn_fts_center],
-                                   dim=-1)  # local_features: torch.Size([N, P, K, 26]) local_features.shape[-1] Shape : 2*C
+        valid = mask.squeeze(-1).bool()
+        with torch.no_grad():
+            safe_points = torch.nan_to_num(
+                points.detach(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            distances = self.pairwise_distance(safe_points)
+            valid_edges = valid[:, :, None] & valid[:, None, :]
+            diagonal = torch.eye(num_points, dtype=torch.bool, device=points.device)[None]
+            distances = distances.masked_fill(~valid_edges | diagonal, torch.inf)
+            neighbor_distances, indices = torch.topk(
+                distances, k=num_neighbors, dim=-1, largest=False
+            )
+            neighbor_mask = torch.isfinite(neighbor_distances)
 
-        local_features = self.mlp(local_features)
-        local_features = torch.mean(local_features, dim=2)
+        return indices, neighbor_mask
 
-        return local_features
+    def forward(
+            self,
+            points: Tensor,
+            features: Tensor,
+            mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Embed relative neighbors.
+
+        features: [B, N, C]
+        indices and neighbor_mask: [B, N, K]
+        local_features: [B, N, K, D]
+        """
+        indices, neighbor_mask = self.find_knn(points, mask)
+        batch_size, num_points, num_neighbors = indices.shape
+
+        batch_indices = torch.arange(
+            batch_size, device=features.device
+        )[:, None, None]  # [B, 1, 1]
+        neighbors = features[batch_indices, indices]  # [B, N, K, C]
+        centers = features[:, :, None, :].expand_as(neighbors)  # [B, N, K, C]
+        local_inputs = centers - neighbors  # [B, N, K, C]
+
+        local_features = self.mlp(local_inputs)  # [B, N, K, D]
+        local_features = local_features * neighbor_mask[..., None].to(local_features.dtype)
+        return local_features, indices, neighbor_mask
 
 
 class PETBody(nn.Module):
@@ -275,6 +363,7 @@ class PETBody(nn.Module):
             pair_dim: Optional[int] = None,
             pair_num_heads: Optional[int] = None,
             use_triangle_attention: bool = False,
+            norm_type: str = "DynamicTanh",
     ):
         super().__init__()
         if K < 0:
@@ -305,6 +394,7 @@ class PETBody(nn.Module):
         self.attention_bias_type = attention_bias_type
         self.pair_input_dim = pair_input_dim
         self.use_triangle_attention = use_triangle_attention
+        self.norm_type = norm_type
         self.mode = mode
 
         self.random_drop = RandomDrop(feature_drop if 'all' in self.mode else 0.0, num_keep)
@@ -321,12 +411,21 @@ class PETBody(nn.Module):
         # K == 0 explicitly disables the kNN branch, even when local embedding is enabled.
         self.use_local_embedding = bool(local and K > 0)
         if self.use_local_embedding:
-            self.local_embedding = LocalEmbeddingLayer(num_feat, projection_dim, K, num_local)
+            self.local_embedding = LocalEmbeddingLayer(
+                input_dim=num_feat,
+                projection_dim=projection_dim,
+                K=K,
+                num_local=num_local,
+                num_heads=num_heads,
+                dropout=dropout,
+                drop_probability=drop_probability,
+                norm_type=norm_type,
+            )
 
         self.transformer_blocks = nn.ModuleList([
             TransformerBlockModule(
                 projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                drop_probability
+                drop_probability, norm_type=norm_type,
             )
             for _ in range(num_layers)
         ])
@@ -366,7 +465,8 @@ class PETBody(nn.Module):
                 pair_representation: Optional[Tensor] = None,
                 pair_mask: Optional[Tensor] = None,
                 attn_mask: Optional[Tensor]=None,
-                time_masking: Optional[Tensor]=None) -> tuple[Tensor, Optional[Tensor]]:
+                time_masking: Optional[Tensor]=None,
+                local_mask: Optional[Tensor]=None) -> tuple[Tensor, Optional[Tensor]]:
         """
 
         :param input_features: input features (batch_size, num_objects, num_features)
@@ -446,12 +546,10 @@ class PETBody(nn.Module):
         encoded = torch.add(torch.mul(encoded, (1.0 + scale)), shift)
 
         if self.use_local_embedding:
-            points = input_points
-            local_features = input_features
-            local_features = self.local_embedding(
-                x=local_features,
-                points=points,
-                mask=mask
+            local_features, _, _ = self.local_embedding(
+                x=input_features,
+                points=input_points,
+                mask=mask if local_mask is None else local_mask,
             )
             encoded = local_features + encoded  # Combine with original features
 
