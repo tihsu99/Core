@@ -40,31 +40,98 @@ class TransformerBlockModule(nn.Module):
             self.layer_scale1 = LayerScale(layer_scale_init, projection_dim)
             self.layer_scale2 = LayerScale(layer_scale_init, projection_dim)
 
-    def forward(self, x, mask, attn_mask=None):
-        # TransformerBlock input shapes: x: torch.Size([B, P, 128]), mask: torch.Size([B, P, 1])
-        padding_mask = ~(mask.squeeze(2).bool()) if mask is not None else None  # [batch_size, num_objects]
-        if self.talking_head:
+    def _prepare_attention_bias(self, x, attn_bias=None, attn_mask=None):
+        """Build additive logits with one unambiguous mask convention.
 
-            if attn_mask is None:
-                int_matrix = None
+        attn_bias and floating-point attn_mask are additive: positive values
+        encourage attention and negative values suppress it. For a boolean
+        attn_mask, True means blocked and False means allowed.
+        """
+        if attn_bias is None and attn_mask is None:
+            return None
+
+        batch_size, num_objects, _ = x.shape
+        combined = torch.zeros(
+            batch_size,
+            self.num_heads,
+            num_objects,
+            num_objects,
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        if attn_bias is not None:
+            expected = (batch_size, self.num_heads, num_objects, num_objects)
+            if tuple(attn_bias.shape) != expected:
+                raise ValueError(
+                    f"Expected attn_bias with shape {expected}, got {tuple(attn_bias.shape)}."
+                )
+            combined = combined + attn_bias.to(dtype=x.dtype, device=x.device)
+
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                attention_mask_4d = attn_mask[None, None, :, :]
+            elif attn_mask.dim() == 3:
+                attention_mask_4d = attn_mask[:, None, :, :]
+            elif attn_mask.dim() == 4:
+                attention_mask_4d = attn_mask
             else:
-                # Step 1: Create additive attention bias (float) with -inf where masked
-                int_matrix = torch.zeros_like(attn_mask, dtype=torch.float32)  # (N, N)
-                int_matrix[attn_mask] = float('-inf')  # or -1e9 if you prefer finite
+                raise ValueError(
+                    "attn_mask must have shape [N, N], [B, N, N], or [B, H, N, N]."
+                )
 
-                # Step 2: Broadcast to (B, num_heads, N, N)
-                int_matrix = int_matrix.unsqueeze(0).unsqueeze(0).expand(x.shape[0], self.num_heads, attn_mask.shape[0], attn_mask.shape[1])
-            updates, _ = self.attn(self.norm1(x), int_matrix=int_matrix, mask=mask) # TODO: check if attn_mask is correct
+            try:
+                attention_mask_4d = attention_mask_4d.expand_as(combined)
+            except RuntimeError as error:
+                raise ValueError(
+                    f"attn_mask shape {tuple(attn_mask.shape)} is incompatible with "
+                    f"attention shape {tuple(combined.shape)}."
+                ) from error
+
+            if attention_mask_4d.dtype == torch.bool:
+                combined = combined.masked_fill(
+                    attention_mask_4d,
+                    torch.finfo(combined.dtype).min,
+                )
+            else:
+                combined = combined + attention_mask_4d.to(dtype=x.dtype, device=x.device)
+
+        return combined
+
+    def forward(self, x, mask, attn_mask=None, attn_bias=None):
+        # TransformerBlock input shapes: x: torch.Size([B, P, 128]), mask: torch.Size([B, P, 1])
+        valid_object_mask = mask.squeeze(2).bool() if mask is not None else None
+        padding_key_mask = ~valid_object_mask if valid_object_mask is not None else None
+        combined_bias = self._prepare_attention_bias(
+            x=x,
+            attn_bias=attn_bias,
+            attn_mask=attn_mask,
+        )
+
+        attention_padding_mask = padding_key_mask
+        if combined_bias is not None and padding_key_mask is not None:
+            # Attention logits are [B, H, query, key]. Mask only the key axis;
+            # padded query outputs are zeroed by x * mask below.
+            combined_bias = combined_bias.masked_fill(
+                padding_key_mask[:, None, None, :],
+                torch.finfo(combined_bias.dtype).min,
+            )
+            attention_padding_mask = None
+
+        if self.talking_head:
+            updates, _ = self.attn(
+                self.norm1(x),
+                int_matrix=combined_bias,
+                mask=mask if attention_padding_mask is not None else None,
+            )
         else:
-            if (attn_mask is not None) and (attn_mask.dim() == 3):
-                batch_size, tgt_len, src_len = attn_mask.size()
-                attn_mask = attn_mask.view(batch_size, 1, tgt_len, src_len)
-                attn_mask = attn_mask.expand(batch_size, self.num_heads, tgt_len, src_len)
-                attn_mask = attn_mask.reshape(batch_size * self.num_heads, tgt_len, src_len)
+            multihead_bias = None
+            if combined_bias is not None:
+                multihead_bias = combined_bias.flatten(0, 1)
 
             updates, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x),
-                                   key_padding_mask=padding_mask,
-                                   attn_mask=attn_mask)
+                                   key_padding_mask=attention_padding_mask,
+                                   attn_mask=multihead_bias)
 
         if self.layer_scale_flag:
             # Input updates: torch.Size([B, P, 128]), mask: torch.Size([B, P])
@@ -395,4 +462,3 @@ class SegmentationTransformerBlockModule(nn.Module):
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
-

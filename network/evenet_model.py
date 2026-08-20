@@ -6,6 +6,7 @@ from evenet.network.layers.utils import RandomDrop
 from evenet.network.layers.invisible_input_projector import InvisibleInputProjector
 
 from evenet.network.body.normalizer import Normalizer
+from evenet.network.body.pair_creator import PairCreator
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
 from evenet.network.body.object_encoder import ObjectEncoder
 from evenet.network.heads.classification.classification_head import ClassificationHead, RegressionHead
@@ -139,8 +140,26 @@ class EveNetModel(nn.Module):
             dropout=global_embedding_cfg.dropout
         )
 
+        # Optional physics pair-feature creator.
+        pair_cfg = self.network_cfg.Body.get(
+            "PairCreator",
+            None,
+        )
+
+        self.enable_pair_creator = (
+                pair_cfg is not None
+                and len(pair_cfg.get("create", [])) > 0
+        )
+
+        if self.enable_pair_creator:
+            self.PairCreator = PairCreator(
+                event_info=self.event_info,
+                create=pair_cfg.create,
+            )
+
         # [1] Body
         pet_config = self.network_cfg.Body.PET
+        pair_input_dim = self.PairCreator.output_dim if self.enable_pair_creator else 0
         self.PET = PETBody(
             num_feat=self.sequential_input_dim,
             num_keep=pet_config.num_feature_keep,
@@ -157,6 +176,11 @@ class EveNetModel(nn.Module):
             layer_scale_init=pet_config.layer_scale_init,
             dropout=pet_config.dropout,
             mode=pet_config.mode,
+            attention_bias_type=pet_config.get("attention_bias_type", None),
+            pair_input_dim=pair_input_dim,
+            pair_dim=pet_config.get("pair_dim", None),
+            pair_num_heads=pet_config.get("pair_num_heads", None),
+            use_triangle_attention=pet_config.get("use_triangle_attention", False),
         )
 
         # [2] Classification + Regression + Assignment Body
@@ -324,13 +348,39 @@ class EveNetModel(nn.Module):
             return x
         return self.InvisibleInputProjector(x=x, mask=mask)
 
+    def create_pair_representation(
+            self,
+            x: Tensor,
+            mask: Tensor,
+            normalized: bool = False,
+            output_size: Optional[int] = None,
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+        """Create physical pair features, optionally padding to a longer sequence."""
+        if not self.enable_pair_creator:
+            return None, None
+
+        pair_source = x
+        if normalized:
+            pair_source = self.sequential_normalizer.denormalize(
+                x=x.clone(),
+                mask=mask,
+            )
+
+        pair_features, pair_mask = self.PairCreator(
+            x=pair_source,
+            mask=mask,
+            output_size=output_size,
+        )
+
+        return pair_features, pair_mask
+
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,
             progressive_params: dict = None,
             schedules: list[tuple[str, bool]] = None
     ) -> dict[str, dict[Any, Any] | Any]:
         """
-
+        🧋This is the core forward function of the model. Only modulized network is included.
         :param schedules:
         :param time:
         :param progressive_params:
@@ -370,7 +420,8 @@ class EveNetModel(nn.Module):
 
         _, alpha, _ = get_logsnr_alpha_sigma(time)
 
-        input_point_cloud = x['x']
+        raw_input_point_cloud = x['x']
+        input_point_cloud = raw_input_point_cloud.clone()
         input_point_cloud_mask = x['x_mask'].unsqueeze(-1)
         global_conditions = x['conditions'].unsqueeze(1)  # (batch_size, 1, num_conditions)
         global_conditions_mask = x['conditions_mask'].unsqueeze(-1)  # (batch_size, 1, 1)
@@ -459,6 +510,7 @@ class EveNetModel(nn.Module):
             }
 
         outputs = dict()
+        pair_representations = dict()
         if schedules is None:
             schedules = self.schedule_flags
 
@@ -526,6 +578,36 @@ class EveNetModel(nn.Module):
                 ).float()
                 global_feature_mask = torch.ones_like(global_conditions).float()
 
+            #########################
+            ## Pair Representation ##
+            #########################
+
+            pair_features = None
+            pair_mask = None
+            if self.enable_pair_creator:
+                if schedule_name == "generation":
+                    pair_source = full_input_point_cloud
+                    pair_source_mask = full_input_point_cloud_mask
+                    pair_source_is_normalized = True
+                else:
+                    # Deterministic and neutrino schedules use clean visible objects.
+                    # Neutrino projector outputs are not physical four-vectors.
+                    pair_source = raw_input_point_cloud
+                    pair_source_mask = input_point_cloud_mask
+                    pair_source_is_normalized = False
+
+                pair_features, pair_mask = self.create_pair_representation(
+                    x=pair_source,
+                    mask=pair_source_mask,
+                    normalized=pair_source_is_normalized,
+                    output_size=full_input_point_cloud.shape[1],
+                )
+                pair_representations[schedule_name] = {
+                    "features": pair_features,
+                    "input": pair_features,
+                    "mask": pair_mask,
+                }
+
             #############################
             ## Central embedding (PET) ##
             #############################
@@ -536,14 +618,18 @@ class EveNetModel(nn.Module):
             )
 
             local_points = full_input_point_cloud[..., self.local_feature_indices]
-            full_input_point_cloud = self.PET(
+            full_input_point_cloud, pair_output = self.PET(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
                 mask=full_input_point_cloud_mask,
+                pair_representation=pair_features,
+                pair_mask=pair_mask,
                 attn_mask=full_attn_mask,
                 time=full_time,
                 time_masking=time_masking
             )
+            if self.enable_pair_creator:
+                pair_representations[schedule_name]["output"] = pair_output
 
             if schedule_name == "deterministic" or schedule_name == "generation":
                 ######################################
@@ -657,6 +743,7 @@ class EveNetModel(nn.Module):
             "classification-noised": outputs.get("generation", {}).get("classification", None),
             "regression-noised": outputs.get("generation", {}).get("regression", None),
             "generations": generations,
+            "pair_representations": pair_representations,
             "segmentation-cls": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_logits", None),
             # "full_input_point_cloud": full_input_point_cloud,
             # "full_global_conditions": full_global_conditions,
@@ -722,11 +809,18 @@ class EveNetModel(nn.Module):
             noise_x_mask[..., self.generation_pc_indices] = 1.0
             noise_x = noise_x * noise_x_mask
 
+            pair_features, pair_mask = self.create_pair_representation(
+                x=noise_x,
+                mask=noise_mask,
+                normalized=True,
+            )
             local_points = noise_x[..., self.local_feature_indices]
-            input_point_cloud = self.PET(
+            input_point_cloud, _ = self.PET(
                 input_features=noise_x,
                 input_points=local_points,
                 mask=noise_mask,
+                pair_representation=pair_features,
+                pair_mask=pair_mask,
                 time=time
             )
             pred_point_cloud_vector = self.ReconGeneration(
@@ -746,7 +840,8 @@ class EveNetModel(nn.Module):
             class_label = cond_x['classification'].unsqueeze(-1) if 'classification' in cond_x else torch.zeros_like(
                 cond_x['conditions_mask']).long()  # (batch_size, 1)
             # num_point_cloud = cond_x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
-            input_point_cloud = cond_x['x']
+            raw_input_point_cloud = cond_x['x']
+            input_point_cloud = raw_input_point_cloud.clone()
             input_point_cloud_mask = cond_x['x_mask'].unsqueeze(-1)
 
             input_point_cloud = self.sequential_normalizer(
@@ -793,11 +888,19 @@ class EveNetModel(nn.Module):
                 mask=global_conditions_mask
             )
 
+            pair_features, pair_mask = self.create_pair_representation(
+                x=raw_input_point_cloud,
+                mask=input_point_cloud_mask,
+                normalized=False,
+                output_size=full_input_point_cloud.shape[1],
+            )
             local_points = full_input_point_cloud[..., self.local_feature_indices]
-            full_input_point_cloud = self.PET(
+            full_input_point_cloud, _ = self.PET(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
                 mask=full_input_point_cloud_mask,
+                pair_representation=pair_features,
+                pair_mask=pair_mask,
                 attn_mask=full_attn_mask,
                 time=full_time,
                 time_masking=time_masking

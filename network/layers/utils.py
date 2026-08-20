@@ -71,8 +71,8 @@ class TalkingHeadAttention(nn.Module):
 
 
         if mask is not None:
-            mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
-            attn = attn + ((1.0 - mask.float()) * -1e9)
+            key_mask = mask.squeeze(-1).bool()[:, None, None, :]
+            attn = attn.masked_fill(~key_mask, torch.finfo(attn.dtype).min)
 
         attn = F.softmax(attn, dim=-1)
         attn = self.proj_w(attn.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)

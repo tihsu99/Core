@@ -9,6 +9,12 @@ from evenet.network.layers.transformer import TransformerBlockModule
 from evenet.network.layers.utils import RandomDrop
 import torch
 from evenet.network.body.adapter import Adapter
+from evenet.network.body.pairformer import (
+    PairBias,
+    PairEmbedding,
+    PairToAttentionBias,
+    PairUpdateBlock,
+)
 
 class EmbeddingStack(nn.Module):
     def __init__(self, linear_block_type: str,
@@ -263,9 +269,29 @@ class PETBody(nn.Module):
     def __init__(
             self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
             num_layers, num_heads, drop_probability, talking_head, layer_scale,
-            layer_scale_init, dropout, mode, use_adapter: bool = False
+            layer_scale_init, dropout, mode, use_adapter: bool = False,
+            attention_bias_type: Optional[str] = None,
+            pair_input_dim: int = 0,
+            pair_dim: Optional[int] = None,
+            pair_num_heads: Optional[int] = None,
+            use_triangle_attention: bool = False,
     ):
         super().__init__()
+        if K < 0:
+            raise ValueError(f"K must be non-negative, got {K}.")
+        if attention_bias_type not in (None, "SimpleAddition", "IterativeUpdate"):
+            raise ValueError(
+                "attention_bias_type must be None, 'SimpleAddition', or 'IterativeUpdate'."
+            )
+        if attention_bias_type is not None and pair_input_dim <= 0:
+            raise ValueError(
+                f"{attention_bias_type} requires a positive pair_input_dim."
+            )
+        if use_triangle_attention and attention_bias_type != "IterativeUpdate":
+            raise ValueError(
+                "use_triangle_attention is only valid with attention_bias_type='IterativeUpdate'."
+            )
+
         self.num_keep = num_keep
         self.feature_drop = feature_drop
         self.projection_dim = projection_dim
@@ -276,6 +302,9 @@ class PETBody(nn.Module):
         self.layer_scale = layer_scale
         self.layer_scale_init = layer_scale_init
         self.dropout = dropout
+        self.attention_bias_type = attention_bias_type
+        self.pair_input_dim = pair_input_dim
+        self.use_triangle_attention = use_triangle_attention
         self.mode = mode
 
         self.random_drop = RandomDrop(feature_drop if 'all' in self.mode else 0.0, num_keep)
@@ -289,7 +318,9 @@ class PETBody(nn.Module):
         self.time_embedding = FourierEmbedding(projection_dim)
         self.time_embed_linear = nn.Linear(projection_dim, 2 * projection_dim, bias=False)
 
-        if local:
+        # K == 0 explicitly disables the kNN branch, even when local embedding is enabled.
+        self.use_local_embedding = bool(local and K > 0)
+        if self.use_local_embedding:
             self.local_embedding = LocalEmbeddingLayer(num_feat, projection_dim, K, num_local)
 
         self.transformer_blocks = nn.ModuleList([
@@ -299,6 +330,25 @@ class PETBody(nn.Module):
             )
             for _ in range(num_layers)
         ])
+
+        if self.attention_bias_type == "SimpleAddition":
+            self.simple_pair_bias = PairBias(pair_input_dim, num_heads)
+        elif self.attention_bias_type == "IterativeUpdate":
+            pair_dim = projection_dim if pair_dim is None else pair_dim
+            pair_num_heads = num_heads if pair_num_heads is None else pair_num_heads
+            if pair_dim <= 0:
+                raise ValueError(f"pair_dim must be positive, got {pair_dim}.")
+
+            self.pair_embedding = PairEmbedding(pair_input_dim, pair_dim)
+            self.pair_update_blocks = nn.ModuleList([
+                PairUpdateBlock(
+                    pair_dim=pair_dim,
+                    num_heads=pair_num_heads,
+                    use_triangle_attention=use_triangle_attention,
+                )
+                for _ in range(num_layers)
+            ])
+            self.iterative_pair_bias = PairToAttentionBias(pair_dim, num_heads)
 
         self.use_adapter = use_adapter
         if self.use_adapter:
@@ -313,8 +363,10 @@ class PETBody(nn.Module):
                 input_points: Tensor,
                 mask: Tensor,
                 time: Tensor,
+                pair_representation: Optional[Tensor] = None,
+                pair_mask: Optional[Tensor] = None,
                 attn_mask: Optional[Tensor]=None,
-                time_masking: Optional[Tensor]=None) -> Tensor:
+                time_masking: Optional[Tensor]=None) -> tuple[Tensor, Optional[Tensor]]:
         """
 
         :param input_features: input features (batch_size, num_objects, num_features)
@@ -324,8 +376,62 @@ class PETBody(nn.Module):
         :param time_masking: time masking for diffusion model usage (batch_size, num_objects, 1)
         :return:
         """
+        if pair_representation is not None:
+            if pair_representation.ndim != 4:
+                raise ValueError(
+                    "pair_representation must have shape [B, N, N, D_pair], "
+                    f"got {tuple(pair_representation.shape)}."
+                )
+            expected_pair_shape = (
+                input_features.shape[0],
+                input_features.shape[1],
+                input_features.shape[1],
+            )
+            if tuple(pair_representation.shape[:3]) != expected_pair_shape:
+                raise ValueError(
+                    "pair_representation must share [B, N, N] with input_features; "
+                    f"expected {expected_pair_shape}, got {tuple(pair_representation.shape)}."
+                )
+            if (
+                self.attention_bias_type is not None
+                and pair_representation.shape[-1] != self.pair_input_dim
+            ):
+                raise ValueError(
+                    f"Expected {self.pair_input_dim} input pair features, "
+                    f"got {pair_representation.shape[-1]}."
+                )
+            if pair_mask is None:
+                object_mask = mask.squeeze(-1).bool()
+                pair_mask = object_mask[:, :, None] & object_mask[:, None, :]
+
+        if self.attention_bias_type is not None and pair_representation is None:
+            raise ValueError(
+                f"attention_bias_type='{self.attention_bias_type}' requires pair_representation."
+            )
+        if pair_mask is not None:
+            expected_mask_shape = (
+                input_features.shape[0],
+                input_features.shape[1],
+                input_features.shape[1],
+            )
+            if tuple(pair_mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    f"Expected pair_mask with shape {expected_mask_shape}, "
+                    f"got {tuple(pair_mask.shape)}."
+                )
+            pair_mask = pair_mask.bool()
+        if pair_representation is not None:
+            # Keep returned pair state independent from the caller's input tensor.
+            pair_representation = pair_representation.clone()
+
         encoded = self.random_drop(input_features)
         encoded = self.feature_embedding(encoded)
+
+        static_attention_bias = None
+        if self.attention_bias_type == "SimpleAddition":
+            static_attention_bias = self.simple_pair_bias(pair_representation, pair_mask)
+        elif self.attention_bias_type == "IterativeUpdate":
+            pair_representation = self.pair_embedding(pair_representation, pair_mask)
 
         time = time.unsqueeze(1).unsqueeze(1).repeat(1, encoded.shape[1], 1)
         if time_masking is not None:
@@ -339,7 +445,7 @@ class PETBody(nn.Module):
 
         encoded = torch.add(torch.mul(encoded, (1.0 + scale)), shift)
 
-        if hasattr(self, 'local_embedding'):
+        if self.use_local_embedding:
             points = input_points
             local_features = input_features
             local_features = self.local_embedding(
@@ -351,17 +457,26 @@ class PETBody(nn.Module):
 
         skip_connection = encoded
         for itransformer, transformer_block in enumerate(self.transformer_blocks):
+            attention_bias = static_attention_bias
+            if self.attention_bias_type == "IterativeUpdate":
+                pair_representation = self.pair_update_blocks[itransformer](
+                    pair_representation,
+                    pair_mask,
+                )
+                attention_bias = self.iterative_pair_bias(pair_representation, pair_mask)
+
             encoded = transformer_block(
                 x=encoded,
                 mask=mask,
-                attn_mask=attn_mask
+                attn_mask=attn_mask,
+                attn_bias=attention_bias,
             )
             if self.use_adapter:
                 encoded = self.adapters[itransformer](encoded)
                 encoded = encoded * mask.float()
 
 
-        return torch.add(encoded, skip_connection)
+        return torch.add(encoded, skip_connection), pair_representation
 
 
 class PositionEmbedding(nn.Module):
@@ -440,4 +555,3 @@ class PointCloudPositionalEmbedding(nn.Module):
         x = (x + position_token) * x_mask.float()
 
         return x  # (B, N, D)
-
