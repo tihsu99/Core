@@ -26,6 +26,7 @@ _PUBLICATION_STYLE = {
     "xtick.major.width": 0.6,
     "ytick.major.width": 0.6,
 }
+_FIGURE_DPI = 200
 
 _STAGE_COLORS = {"raw": "#6F7782", "p0": "#4C78A8", "pl": "#D9772A"}
 _GROUP_COLORS = (
@@ -600,7 +601,7 @@ def _build_publication_figures(
                 f"pair_monitor/pca_explained_variance/{process_name}/{stage}"
             ] = sum(projection.explained_variance)
 
-        figures[f"pca/{_safe_key(process_name)}"] = _plot_process_figure(
+        pca_figure, metrics_figure = _plot_process_figures(
             process_name=process_name,
             coordinates=coordinates,
             labels=plot_labels,
@@ -609,6 +610,9 @@ def _build_publication_figures(
             stage_scores=scores_by_process[process_name],
             gains=gains_by_process[process_name],
         )
+        safe_process_name = _safe_key(process_name)
+        figures[f"pca/{safe_process_name}"] = pca_figure
+        figures[f"metrics/{safe_process_name}"] = metrics_figure
 
     figures["summary"] = _plot_summary_figure(
         scores_by_process=scores_by_process,
@@ -639,7 +643,7 @@ def _balanced_plot_indices(
     return torch.cat(selected)
 
 
-def _plot_process_figure(
+def _plot_process_figures(
     process_name: str,
     coordinates: Mapping[str, Tensor],
     labels: Tensor,
@@ -647,17 +651,15 @@ def _plot_process_figure(
     projections: Mapping[str, _PCAProjection],
     stage_scores: Mapping[str, float],
     gains: Mapping[str, float],
-) -> Figure:
-    figure = plt.figure(figsize=(7.2, 5.8), facecolor="white")
+) -> tuple[Figure, Figure]:
+    figure = plt.figure(figsize=(12.0, 3.8), dpi=_FIGURE_DPI, facecolor="white")
     grid = figure.add_gridspec(
-        2,
+        1,
         4,
         left=0.075,
         right=0.985,
         top=0.88,
-        bottom=0.20,
-        height_ratios=(2.5, 1.0),
-        hspace=0.55,
+        bottom=0.18,
         wspace=0.42,
     )
     group_styles = _group_styles(labels, group_names)
@@ -667,13 +669,13 @@ def _plot_process_figure(
         "pl": "Updated latent PL",
         "pl_minus_p0": "Latent update PL - P0",
     }
-    panel_letters = "abcdef"
+    panel_letters = "abcd"
 
     for column, stage in enumerate(("raw", "p0", "pl", "pl_minus_p0")):
         explained = sum(projections[stage].explained_variance)
         _draw_pca_distribution(
             figure=figure,
-            slot=grid[0, column],
+            slot=grid[column],
             coordinates=coordinates[stage],
             labels=labels,
             group_names=group_names,
@@ -681,11 +683,6 @@ def _plot_process_figure(
             title=f"{stage_titles[stage]}\nPC1 + PC2 = {explained:.1%}",
             panel_letter=panel_letters[column],
         )
-
-    score_axis = figure.add_subplot(grid[1, :2])
-    _draw_stage_scores(score_axis, stage_scores, panel_letters[4])
-    gain_axis = figure.add_subplot(grid[1, 2:])
-    _draw_separation_gains(gain_axis, gains, panel_letters[5])
 
     handles = [
         Line2D(
@@ -720,7 +717,23 @@ def _plot_process_figure(
         fontsize=9,
         fontweight="bold",
     )
-    return figure
+    metrics_figure, axes = plt.subplots(
+        1, 2, figsize=(7.2, 3.2), dpi=_FIGURE_DPI, facecolor="white"
+    )
+    metrics_figure.subplots_adjust(
+        left=0.10, right=0.98, top=0.76, bottom=0.20, wspace=0.38
+    )
+    _draw_stage_scores(axes[0], stage_scores, "a")
+    _draw_separation_gains(axes[1], gains, "b")
+    metrics_figure.suptitle(
+        f"Pair-representation metrics | {process_name}",
+        x=0.10,
+        y=0.96,
+        ha="left",
+        fontsize=9,
+        fontweight="bold",
+    )
+    return figure, metrics_figure
 
 
 def _draw_pca_distribution(
@@ -890,82 +903,45 @@ def _plot_summary_figure(
     gains_by_process: Mapping[str, Mapping[str, float]],
 ) -> Figure:
     process_names = [name for name in scores_by_process if name != "all"]
-    figure, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), facecolor="white")
-    figure.subplots_adjust(left=0.08, right=0.98, top=0.78, bottom=0.20, wspace=0.34)
+    figure, axes = plt.subplots(
+        1, 2, figsize=(10.8, 3.4), dpi=_FIGURE_DPI, facecolor="white"
+    )
+    figure.subplots_adjust(left=0.07, right=0.99, top=0.78, bottom=0.28, wspace=0.28)
 
     score_axis, gain_axis = axes
-    for index, stage in enumerate(("raw", "p0", "pl")):
-        values = _finite_values(
-            scores_by_process[name][stage] for name in process_names
+    positions = torch.arange(len(process_names)).tolist()
+    score_width = 0.24
+    for offset, stage in zip((-score_width, 0.0, score_width), ("raw", "p0", "pl")):
+        score_axis.bar(
+            [position + offset for position in positions],
+            [scores_by_process[name][stage] for name in process_names],
+            width=score_width,
+            color=_STAGE_COLORS[stage],
+            label=stage.upper(),
         )
-        _draw_distribution_column(
-            score_axis,
-            index,
-            values,
-            _STAGE_COLORS[stage],
-        )
-        all_value = scores_by_process.get("all", {}).get(stage, float("nan"))
-        if math.isfinite(all_value):
-            score_axis.scatter(
-                index,
-                all_value,
-                s=35,
-                marker="D",
-                facecolor="white",
-                edgecolor="#111111",
-                linewidth=0.9,
-                zorder=4,
-            )
-    score_axis.set_xticks(range(3), ("Raw", "P0", "PL"))
+    score_axis.set_xticks(positions, process_names, rotation=25, ha="right")
     score_axis.set_ylabel("Centroid separation")
     score_axis.set_ylim(0.0, 1.0)
-    score_axis.set_title("Distribution across processes", fontsize=8, pad=5)
+    score_axis.set_title("Separation by process", fontsize=8, pad=5)
     _style_summary_axis(score_axis, "a")
+    score_axis.legend(frameon=False, fontsize=6, ncol=3, loc="upper left")
 
     gain_specs = (("pl_minus_p0", "PL - P0"), ("pl_minus_raw", "PL - raw"))
-    for index, (gain_name, _) in enumerate(gain_specs):
-        values = _finite_values(
-            gains_by_process[name][gain_name] for name in process_names
+    gain_width = 0.34
+    for offset, (gain_name, label) in zip((-gain_width / 2, gain_width / 2), gain_specs):
+        gain_axis.bar(
+            [position + offset for position in positions],
+            [gains_by_process[name][gain_name] for name in process_names],
+            width=gain_width,
+            color="#348A64" if gain_name == "pl_minus_p0" else "#D9772A",
+            label=label,
         )
-        _draw_signed_distribution_column(gain_axis, index, values)
-        all_value = gains_by_process.get("all", {}).get(gain_name, float("nan"))
-        if math.isfinite(all_value):
-            gain_axis.scatter(
-                index,
-                all_value,
-                s=35,
-                marker="D",
-                facecolor="white",
-                edgecolor="#111111",
-                linewidth=0.9,
-                zorder=4,
-            )
-    gain_axis.set_xticks(range(2), [label for _, label in gain_specs])
+    gain_axis.set_xticks(positions, process_names, rotation=25, ha="right")
     gain_axis.set_ylabel("Separation gain")
     gain_axis.axhline(0.0, color="#333333", linewidth=0.7)
-    gain_axis.set_title("Signed update gains", fontsize=8, pad=5)
+    gain_axis.set_title("Update gains by process", fontsize=8, pad=5)
     _style_summary_axis(gain_axis, "b")
-
-    legend_handles = [
-        Line2D([0], [0], marker="o", linestyle="none", color="#777777", markersize=4),
-        Line2D(
-            [0],
-            [0],
-            marker="D",
-            linestyle="none",
-            markerfacecolor="white",
-            markeredgecolor="#111111",
-            markersize=4.5,
-        ),
-    ]
-    figure.legend(
-        legend_handles,
-        ("Individual process", "All pairs"),
-        loc="lower center",
-        ncol=2,
-        frameon=False,
-        fontsize=6,
-    )
+    gain_axis.legend(frameon=False, fontsize=6, ncol=2, loc="upper left")
     figure.suptitle(
         f"Pair-representation summary | {len(process_names)} processes",
         x=0.08,
@@ -975,48 +951,6 @@ def _plot_summary_figure(
         fontweight="bold",
     )
     return figure
-
-
-def _draw_distribution_column(axis, position: int, values: list[float], color: str) -> None:
-    if not values:
-        return
-    jitter = _deterministic_jitter(len(values), position)
-    axis.scatter(jitter, values, s=13, color=color, alpha=0.65, linewidth=0)
-    median = float(torch.tensor(values).median())
-    axis.plot(
-        [position - 0.18, position + 0.18],
-        [median, median],
-        color="#111111",
-        linewidth=1.1,
-        zorder=3,
-    )
-
-
-def _draw_signed_distribution_column(axis, position: int, values: list[float]) -> None:
-    if not values:
-        return
-    jitter = _deterministic_jitter(len(values), position)
-    colors = ["#348A64" if value >= 0 else "#B54A4A" for value in values]
-    axis.scatter(jitter, values, s=13, color=colors, alpha=0.72, linewidth=0)
-    median = float(torch.tensor(values).median())
-    axis.plot(
-        [position - 0.18, position + 0.18],
-        [median, median],
-        color="#111111",
-        linewidth=1.1,
-        zorder=3,
-    )
-
-
-def _deterministic_jitter(count: int, position: int) -> list[float]:
-    if count == 1:
-        return [float(position)]
-    offsets = torch.linspace(-0.16, 0.16, count)
-    return (offsets + position).tolist()
-
-
-def _finite_values(values) -> list[float]:
-    return [float(value) for value in values if math.isfinite(float(value))]
 
 
 def _style_summary_axis(axis, panel_letter: str) -> None:
