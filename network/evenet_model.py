@@ -961,10 +961,17 @@ class EveNetModel(nn.Module):
     def shared_step(
             self, batch: Dict[str, Tensor], batch_size,
             train_parameters: Union[dict, None],
-            schedules: Union[list[tuple[str, bool]], None] = None
+            schedules: Union[list[tuple[str, bool]], None] = None,
+            return_pair_states: bool = False,
     ) -> dict:
         time = torch.rand((batch_size,), device=batch['x'].device, dtype=batch['x'].dtype)
-        output = self.forward(batch, time, progressive_params=train_parameters, schedules=schedules)
+        output = self.forward(
+            batch,
+            time,
+            progressive_params=train_parameters,
+            schedules=schedules,
+            return_pair_states=return_pair_states,
+        )
         return output
 
     def freeze_module(self, logical_name: str, cfg: dict):
