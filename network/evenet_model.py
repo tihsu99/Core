@@ -184,6 +184,7 @@ class EveNetModel(nn.Module):
             pair_dim=pet_config.get("pair_dim", None),
             pair_num_heads=pet_config.get("pair_num_heads", None),
             use_triangle_attention=pet_config.get("use_triangle_attention", False),
+            use_object_to_pair=pet_config.get("use_object_to_pair", False),
             norm_type=pet_config.get("norm_type", "DynamicTanh"),
         )
 

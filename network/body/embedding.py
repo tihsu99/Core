@@ -12,6 +12,7 @@ from evenet.network.body.adapter import Adapter
 from evenet.network.body.pairformer import (
     PairBias,
     PairEmbedding,
+    ObjectToPair,
     PairToAttentionBias,
     PairUpdateBlock,
 )
@@ -363,6 +364,7 @@ class PETBody(nn.Module):
             pair_dim: Optional[int] = None,
             pair_num_heads: Optional[int] = None,
             use_triangle_attention: bool = False,
+            use_object_to_pair: bool = False,
             norm_type: str = "DynamicTanh",
     ):
         super().__init__()
@@ -380,6 +382,10 @@ class PETBody(nn.Module):
             raise ValueError(
                 "use_triangle_attention is only valid with attention_bias_type='IterativeUpdate'."
             )
+        if use_object_to_pair and attention_bias_type != "IterativeUpdate":
+            raise ValueError(
+                "use_object_to_pair is only valid with attention_bias_type='IterativeUpdate'."
+            )
 
         self.num_keep = num_keep
         self.feature_drop = feature_drop
@@ -394,6 +400,7 @@ class PETBody(nn.Module):
         self.attention_bias_type = attention_bias_type
         self.pair_input_dim = pair_input_dim
         self.use_triangle_attention = use_triangle_attention
+        self.use_object_to_pair = use_object_to_pair
         self.norm_type = norm_type
         self.mode = mode
 
@@ -448,6 +455,11 @@ class PETBody(nn.Module):
                 for _ in range(num_layers)
             ])
             self.iterative_pair_bias = PairToAttentionBias(pair_dim, num_heads)
+            if self.use_object_to_pair:
+                self.object_to_pair_blocks = nn.ModuleList([
+                    ObjectToPair(projection_dim, pair_dim)
+                    for _ in range(num_layers)
+                ])
 
         self.use_adapter = use_adapter
         if self.use_adapter:
@@ -576,6 +588,11 @@ class PETBody(nn.Module):
             if self.use_adapter:
                 encoded = self.adapters[itransformer](encoded)
                 encoded = encoded * mask.float()
+            if self.use_object_to_pair:
+                pair_representation = (
+                    pair_representation
+                    + self.object_to_pair_blocks[itransformer](encoded, pair_mask)
+                )
 
         output = torch.add(encoded, skip_connection)
         return output, pair_representation, pair_input

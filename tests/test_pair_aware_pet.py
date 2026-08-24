@@ -1,6 +1,7 @@
 import torch
 
 from evenet.network.body.embedding import LocalEmbeddingLayer, PETBody
+from evenet.network.body.pairformer import ObjectToPair
 from evenet.network.layers.norm import DynamicTanh
 from evenet.network.layers.transformer import TransformerBlockModule
 
@@ -25,6 +26,7 @@ def make_pet(
     local=True,
     k=0,
     use_triangle_attention=False,
+    use_object_to_pair=False,
     talking_head=False,
     norm_type="DynamicTanh",
 ):
@@ -49,6 +51,7 @@ def make_pet(
         pair_dim=8,
         pair_num_heads=2,
         use_triangle_attention=use_triangle_attention,
+        use_object_to_pair=use_object_to_pair,
         norm_type=norm_type,
     ).eval()
 
@@ -192,6 +195,55 @@ def test_iterative_update_exposes_p0_only_when_requested():
     assert p0.data_ptr() != pl.data_ptr()
 
 
+def test_ordered_object_latents_update_pair_state():
+    model = make_pet("IterativeUpdate", use_object_to_pair=True)
+    features, mask, pair, pair_mask, time = make_inputs()
+
+    _, pair_output, _ = model(
+        input_features=features,
+        input_points=features[..., :2],
+        mask=mask,
+        time=time,
+        pair_representation=pair,
+        pair_mask=pair_mask,
+    )
+    _, changed_pair_output, _ = model(
+        input_features=features.flip(1),
+        input_points=features.flip(1)[..., :2],
+        mask=mask,
+        time=time,
+        pair_representation=pair,
+        pair_mask=pair_mask,
+    )
+
+    assert model.use_object_to_pair
+    assert not torch.allclose(pair_output, changed_pair_output)
+    assert not torch.allclose(pair_output[:, 0, 1], pair_output[:, 1, 0])
+    assert torch.all(pair_output[~pair_mask] == 0)
+
+
+def test_object_to_pair_keeps_source_and_target_order():
+    layer = ObjectToPair(object_dim=2, pair_dim=1).eval()
+    with torch.no_grad():
+        layer.projection[1].weight.zero_()
+        layer.projection[1].bias.zero_()
+        layer.projection[1].weight[0, 0] = 1.0
+        layer.projection[3].weight.zero_()
+        layer.projection[3].bias.zero_()
+        layer.projection[3].weight[0, 0] = 1.0
+
+    objects = torch.tensor([[[3.0, 0.0], [0.0, 1.0], [9.0, 9.0]]])
+    pair_mask = torch.tensor([[
+        [True, True, False],
+        [True, True, False],
+        [False, False, False],
+    ]])
+    update = layer(objects, pair_mask)
+
+    assert not torch.allclose(update[:, 0, 1], update[:, 1, 0])
+    assert torch.all(update[~pair_mask] == 0)
+
+
 def test_triangle_attention_is_explicitly_opt_in():
     model = make_pet("IterativeUpdate", use_triangle_attention=True)
     features, mask, pair, pair_mask, time = make_inputs()
@@ -322,6 +374,9 @@ if __name__ == "__main__":
     test_local_embedding_uses_fixed_masked_physical_knn()
     test_simple_addition_uses_static_pair_bias_and_returns_independent_pair_output()
     test_iterative_update_returns_masked_persistent_pair_state_without_triangle_attention()
+    test_iterative_update_exposes_p0_only_when_requested()
+    test_ordered_object_latents_update_pair_state()
+    test_object_to_pair_keeps_source_and_target_order()
     test_triangle_attention_is_explicitly_opt_in()
     test_pair_bias_also_works_with_talking_head_attention()
     test_attention_mask_sign_and_validity_conventions_are_not_flipped()

@@ -51,6 +51,26 @@ class PairToAttentionBias(nn.Module):
         return bias.permute(0, 3, 1, 2).contiguous()
 
 
+class ObjectToPair(nn.Module):
+    """Project ordered object latents (h_i, h_j) into the pair state."""
+
+    def __init__(self, object_dim: int, pair_dim: int):
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.LayerNorm(2 * object_dim),
+            nn.Linear(2 * object_dim, 2 * pair_dim),
+            nn.GELU(approximate="none"),
+            nn.Linear(2 * pair_dim, pair_dim),
+        )
+
+    def forward(self, objects: Tensor, pair_mask: Tensor) -> Tensor:
+        num_objects = objects.shape[1]
+        left = objects[:, :, None, :].expand(-1, -1, num_objects, -1)
+        right = objects[:, None, :, :].expand(-1, num_objects, -1, -1)
+        update = self.projection(torch.cat([left, right], dim=-1))
+        return update * pair_mask.unsqueeze(-1).to(update.dtype)
+
+
 class TriangleMultiplication(nn.Module):
     """Gated outgoing or incoming triangle multiplication on pair states."""
 
