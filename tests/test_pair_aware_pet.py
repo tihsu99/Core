@@ -199,7 +199,7 @@ def test_ordered_object_latents_update_pair_state():
     model = make_pet("IterativeUpdate", use_object_to_pair=True)
     features, mask, pair, pair_mask, time = make_inputs()
 
-    _, pair_output, _ = model(
+    output, pair_output, _ = model(
         input_features=features,
         input_points=features[..., :2],
         mask=mask,
@@ -220,6 +220,13 @@ def test_ordered_object_latents_update_pair_state():
     assert not torch.allclose(pair_output, changed_pair_output)
     assert not torch.allclose(pair_output[:, 0, 1], pair_output[:, 1, 0])
     assert torch.all(pair_output[~pair_mask] == 0)
+    object_to_pair_params = [
+        parameter
+        for block in model.object_to_pair_blocks
+        for parameter in block.parameters()
+    ]
+    grads = torch.autograd.grad(output.square().sum(), object_to_pair_params)
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in grads)
 
 
 def test_object_to_pair_keeps_source_and_target_order():

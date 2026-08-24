@@ -573,6 +573,11 @@ class PETBody(nn.Module):
         for itransformer, transformer_block in enumerate(self.transformer_blocks):
             attention_bias = static_attention_bias
             if self.attention_bias_type == "IterativeUpdate":
+                if self.use_object_to_pair:
+                    pair_representation = (
+                        pair_representation
+                        + self.object_to_pair_blocks[itransformer](encoded, pair_mask)
+                    )
                 pair_representation = self.pair_update_blocks[itransformer](
                     pair_representation,
                     pair_mask,
@@ -588,11 +593,6 @@ class PETBody(nn.Module):
             if self.use_adapter:
                 encoded = self.adapters[itransformer](encoded)
                 encoded = encoded * mask.float()
-            if self.use_object_to_pair:
-                pair_representation = (
-                    pair_representation
-                    + self.object_to_pair_blocks[itransformer](encoded, pair_mask)
-                )
 
         output = torch.add(encoded, skip_connection)
         return output, pair_representation, pair_input
