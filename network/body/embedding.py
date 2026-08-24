@@ -466,7 +466,9 @@ class PETBody(nn.Module):
                 pair_mask: Optional[Tensor] = None,
                 attn_mask: Optional[Tensor]=None,
                 time_masking: Optional[Tensor]=None,
-                local_mask: Optional[Tensor]=None) -> tuple[Tensor, Optional[Tensor]]:
+                local_mask: Optional[Tensor]=None,
+                return_pair_states: bool = False
+                ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         """
 
         :param input_features: input features (batch_size, num_objects, num_features)
@@ -528,10 +530,12 @@ class PETBody(nn.Module):
         encoded = self.feature_embedding(encoded)
 
         static_attention_bias = None
+        pair_input = None
         if self.attention_bias_type == "SimpleAddition":
             static_attention_bias = self.simple_pair_bias(pair_representation, pair_mask)
         elif self.attention_bias_type == "IterativeUpdate":
             pair_representation = self.pair_embedding(pair_representation, pair_mask)
+            pair_input = pair_representation if return_pair_states else None
 
         time = time.unsqueeze(1).unsqueeze(1).repeat(1, encoded.shape[1], 1)
         if time_masking is not None:
@@ -573,8 +577,8 @@ class PETBody(nn.Module):
                 encoded = self.adapters[itransformer](encoded)
                 encoded = encoded * mask.float()
 
-
-        return torch.add(encoded, skip_connection), pair_representation
+        output = torch.add(encoded, skip_connection)
+        return output, pair_representation, pair_input
 
 
 class PositionEmbedding(nn.Module):

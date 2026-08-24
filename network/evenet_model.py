@@ -381,7 +381,8 @@ class EveNetModel(nn.Module):
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,
             progressive_params: dict = None,
-            schedules: list[tuple[str, bool]] = None
+            schedules: list[tuple[str, bool]] = None,
+            return_pair_states: bool = False,
     ) -> dict[str, dict[Any, Any] | Any]:
         """
         🧋This is the core forward function of the model. Only modulized network is included.
@@ -607,8 +608,7 @@ class EveNetModel(nn.Module):
                     output_size=full_input_point_cloud.shape[1],
                 )
                 pair_representations[schedule_name] = {
-                    "features": pair_features,
-                    "input": pair_features,
+                    "raw": pair_features,
                     "mask": pair_mask,
                 }
 
@@ -641,7 +641,7 @@ class EveNetModel(nn.Module):
                     input_point_cloud_mask,
                     torch.zeros_like(invisible_point_cloud_mask),
                 ], dim=1)
-            full_input_point_cloud, pair_output = self.PET(
+            full_input_point_cloud, pair_output, pair_input = self.PET(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
                 mask=full_input_point_cloud_mask,
@@ -651,9 +651,11 @@ class EveNetModel(nn.Module):
                 time=full_time,
                 time_masking=time_masking,
                 local_mask=local_mask,
+                return_pair_states=return_pair_states,
             )
             if self.enable_pair_creator:
-                pair_representations[schedule_name]["output"] = pair_output
+                pair_representations[schedule_name]["p0"] = pair_input
+                pair_representations[schedule_name]["pl"] = pair_output
 
             if schedule_name == "deterministic" or schedule_name == "generation":
                 ######################################
@@ -842,7 +844,7 @@ class EveNetModel(nn.Module):
                 x=noise_x.clone(),
                 mask=noise_mask,
             )[..., self.local_feature_indices]
-            input_point_cloud, _ = self.PET(
+            input_point_cloud, _, _ = self.PET(
                 input_features=noise_x,
                 input_points=local_points,
                 mask=noise_mask,
@@ -925,7 +927,7 @@ class EveNetModel(nn.Module):
                 raw_input_point_cloud,
                 (0, 0, 0, full_input_point_cloud.shape[1] - raw_input_point_cloud.shape[1]),
             )[..., self.local_feature_indices]
-            full_input_point_cloud, _ = self.PET(
+            full_input_point_cloud, _, _ = self.PET(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
                 mask=full_input_point_cloud_mask,
