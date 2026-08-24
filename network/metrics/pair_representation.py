@@ -4,6 +4,7 @@ The monitor is intentionally stateless. Run it on an occasional, fixed
 validation batch instead of accumulating tensors throughout an epoch.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -11,7 +12,37 @@ import matplotlib.pyplot as plt
 import torch
 import torch.distributed as dist
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from torch import Tensor
+
+
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
+_PUBLICATION_STYLE = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "DejaVu Sans"],
+    "font.size": 7,
+    "axes.linewidth": 0.7,
+    "xtick.major.width": 0.6,
+    "ytick.major.width": 0.6,
+}
+
+_STAGE_COLORS = {"raw": "#6F7782", "p0": "#4C78A8", "pl": "#D9772A"}
+_GROUP_COLORS = (
+    "#3569A8",
+    "#D9772A",
+    "#4B9B8A",
+    "#8C6BB1",
+    "#C44E52",
+    "#7A9E3A",
+    "#A66A4F",
+    "#4C93B8",
+)
+_SPECIAL_STYLES = {
+    "cross_segment": ("#555555", "^"),
+    "one_unassigned": ("#8A8A8A", "x"),
+    "both_unassigned": ("#B8B8B8", "s"),
+}
 
 
 @dataclass(frozen=True)
@@ -24,11 +55,11 @@ class PairGroupLabels:
 
 @dataclass(frozen=True)
 class PairMonitorResult:
-    """Scalar metrics and PCA diagnostic; nonzero DDP ranks return empty data."""
+    """Scalar metrics and figures; nonzero DDP ranks return empty data."""
 
     metrics: dict[str, float]
     rows: list[dict[str, object]]
-    figure: Optional[Figure]
+    figures: dict[str, Figure]
 
 
 def build_pair_group_labels(
@@ -189,14 +220,20 @@ class PairRepresentationMonitor:
         max_pairs_per_event_group: int = 32,
         random_seed: int = 12345,
         include_all_processes: bool = True,
+        plot_max_pairs_per_group: int = 128,
         sync_distributed: bool = True,
     ) -> None:
-        if max_pairs_per_process_group < 1 or max_pairs_per_event_group < 1:
+        if (
+            max_pairs_per_process_group < 1
+            or max_pairs_per_event_group < 1
+            or plot_max_pairs_per_group < 1
+        ):
             raise ValueError("pair caps must be positive")
         self.max_pairs_per_process_group = max_pairs_per_process_group
         self.max_pairs_per_event_group = max_pairs_per_event_group
         self.random_seed = random_seed
         self.include_all_processes = include_all_processes
+        self.plot_max_pairs_per_group = plot_max_pairs_per_group
         self.sync_distributed = sync_distributed
 
     @torch.no_grad()
@@ -267,7 +304,7 @@ class PairRepresentationMonitor:
             )
         )
         if not is_global_zero:
-            return PairMonitorResult(metrics={}, rows=[], figure=None)
+            return PairMonitorResult(metrics={}, rows=[], figures={})
         if selected_labels.numel() == 0:
             raise ValueError("no valid labelled pairs are available for monitoring")
 
@@ -283,6 +320,8 @@ class PairRepresentationMonitor:
 
         metrics: dict[str, float] = {}
         rows: list[dict[str, object]] = []
+        scores_by_process: dict[str, dict[str, float]] = {}
+        gains_by_process: dict[str, dict[str, float]] = {}
         for process_name, process_id in process_scopes:
             scope = (
                 torch.ones_like(selected_processes, dtype=torch.bool)
@@ -304,29 +343,33 @@ class PairRepresentationMonitor:
                         "num_groups": num_groups,
                     }
                 )
+            gains = {
+                "p0_minus_raw": stage_scores["p0"] - stage_scores["raw"],
+                "pl_minus_p0": stage_scores["pl"] - stage_scores["p0"],
+                "pl_minus_raw": stage_scores["pl"] - stage_scores["raw"],
+            }
+            scores_by_process[process_name] = stage_scores
+            gains_by_process[process_name] = gains
             metrics.update(
                 {
-                    f"pair_monitor/separation_gain/{process_name}/p0_minus_raw": (
-                        stage_scores["p0"] - stage_scores["raw"]
-                    ),
-                    f"pair_monitor/separation_gain/{process_name}/pl_minus_p0": (
-                        stage_scores["pl"] - stage_scores["p0"]
-                    ),
-                    f"pair_monitor/separation_gain/{process_name}/pl_minus_raw": (
-                        stage_scores["pl"] - stage_scores["raw"]
-                    ),
+                    f"pair_monitor/separation_gain/{process_name}/{gain_name}": value
+                    for gain_name, value in gains.items()
                 }
             )
 
-        figure, pca_metrics = _plot_pca(
+        figures, pca_metrics = _plot_publication_figures(
             states=selected_states,
             labels=selected_labels,
             processes=selected_processes,
             process_scopes=process_scopes,
             group_names=groups.names,
+            scores_by_process=scores_by_process,
+            gains_by_process=gains_by_process,
+            plot_max_pairs_per_group=self.plot_max_pairs_per_group,
+            random_seed=self.random_seed,
         )
         metrics.update(pca_metrics)
-        return PairMonitorResult(metrics=metrics, rows=rows, figure=figure)
+        return PairMonitorResult(metrics=metrics, rows=rows, figures=figures)
 
     def _reduce_across_ranks(
         self,
@@ -483,125 +526,555 @@ def _fit_pca(features: Tensor) -> _PCAProjection:
     )
 
 
-def _plot_pca(
+def _plot_publication_figures(
     states: Mapping[str, Tensor],
     labels: Tensor,
     processes: Tensor,
     process_scopes: list[tuple[str, Optional[int]]],
     group_names: Mapping[int, str],
-) -> tuple[Figure, dict[str, float]]:
-    raw_pca = _fit_pca(states["raw"])
-    latent_pca = _fit_pca(torch.cat([states["p0"], states["pl"]], dim=0))
-    coordinates = {
-        "raw": raw_pca.transform(states["raw"]),
-        "p0": latent_pca.transform(states["p0"]),
-        "pl": latent_pca.transform(states["pl"]),
-    }
-    raw_limits = _coordinate_limits(coordinates["raw"])
-    latent_limits = _coordinate_limits(
-        torch.cat([coordinates["p0"], coordinates["pl"]], dim=0)
-    )
+    scores_by_process: Mapping[str, Mapping[str, float]],
+    gains_by_process: Mapping[str, Mapping[str, float]],
+    plot_max_pairs_per_group: int,
+    random_seed: int,
+) -> tuple[dict[str, Figure], dict[str, float]]:
+    """Build one paper-style figure per process and one compact summary."""
 
-    num_rows = len(process_scopes)
-    figure, axes = plt.subplots(
-        num_rows,
-        3,
-        figsize=(9.0, max(2.4 * num_rows, 3.0)),
-        squeeze=False,
-    )
-    present_groups = sorted(torch.unique(labels).tolist())
-    segment_groups = [
-        group
-        for group in present_groups
-        if group_names.get(int(group), "").startswith("segment_")
-        or group_names.get(int(group), "")
-        not in {"cross_segment", "one_unassigned", "both_unassigned"}
-    ]
-    color_map = plt.get_cmap("tab10")
-    colors = {
-        int(group): color_map(index % 10)
-        for index, group in enumerate(segment_groups)
-    }
-    special_styles = {
-        "cross_segment": ("#666666", "^"),
-        "one_unassigned": ("#999999", "x"),
-        "both_unassigned": ("#c0c0c0", "s"),
-    }
+    with plt.rc_context(_PUBLICATION_STYLE):
+        return _build_publication_figures(
+            states=states,
+            labels=labels,
+            processes=processes,
+            process_scopes=process_scopes,
+            group_names=group_names,
+            scores_by_process=scores_by_process,
+            gains_by_process=gains_by_process,
+            plot_max_pairs_per_group=plot_max_pairs_per_group,
+            random_seed=random_seed,
+        )
 
-    stage_titles = {
-        "raw": f"Raw PairCreator\nPCA: {sum(raw_pca.explained_variance):.1%}",
-        "p0": f"P0\nJoint PCA: {sum(latent_pca.explained_variance):.1%}",
-        "pl": f"PL\nJoint PCA: {sum(latent_pca.explained_variance):.1%}",
-    }
-    for row, (process_name, process_id) in enumerate(process_scopes):
-        process_mask = (
+
+def _build_publication_figures(
+    states: Mapping[str, Tensor],
+    labels: Tensor,
+    processes: Tensor,
+    process_scopes: list[tuple[str, Optional[int]]],
+    group_names: Mapping[int, str],
+    scores_by_process: Mapping[str, Mapping[str, float]],
+    gains_by_process: Mapping[str, Mapping[str, float]],
+    plot_max_pairs_per_group: int,
+    random_seed: int,
+) -> tuple[dict[str, Figure], dict[str, float]]:
+
+    figures: dict[str, Figure] = {}
+    metrics: dict[str, float] = {}
+    generator = torch.Generator().manual_seed(random_seed)
+
+    for process_name, process_id in process_scopes:
+        scope = (
             torch.ones_like(processes, dtype=torch.bool)
             if process_id is None
             else processes.eq(process_id)
         )
-        for column, stage_name in enumerate(("raw", "p0", "pl")):
-            axis = axes[row, column]
-            for group in present_groups:
-                group_name = group_names.get(int(group), f"group_{int(group)}")
-                draw = process_mask & labels.eq(group)
-                if not draw.any():
-                    continue
-                color, marker = special_styles.get(
-                    group_name, (colors.get(int(group), "#1f77b4"), "o")
-                )
-                points = coordinates[stage_name][draw]
-                axis.scatter(
-                    points[:, 0],
-                    points[:, 1],
-                    s=10,
-                    alpha=0.5,
-                    c=[color],
-                    marker=marker,
-                    linewidths=0.6,
-                    label=group_name,
-                )
-            if row == 0:
-                axis.set_title(stage_titles[stage_name])
-            if column == 0:
-                axis.set_ylabel(f"{process_name}\nPC2")
-            axis.set_xlabel("PC1")
-            x_limits, y_limits = raw_limits if stage_name == "raw" else latent_limits
-            axis.set_xlim(*x_limits)
-            axis.set_ylim(*y_limits)
-            axis.grid(alpha=0.15, linewidth=0.5)
-
-    legend = {}
-    for axis in axes.flat:
-        handles, legend_labels = axis.get_legend_handles_labels()
-        legend.update(zip(legend_labels, handles))
-    if legend:
-        figure.legend(
-            legend.values(),
-            legend.keys(),
-            loc="lower center",
-            ncol=min(4, len(legend)),
-            frameon=False,
+        plot_indices = _balanced_plot_indices(
+            labels,
+            scope,
+            plot_max_pairs_per_group,
+            generator,
         )
-        figure.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
-    else:
-        figure.tight_layout()
+        plot_labels = labels[plot_indices]
+        plot_states = {
+            "raw": states["raw"][plot_indices],
+            "p0": states["p0"][plot_indices],
+            "pl": states["pl"][plot_indices],
+            "pl_minus_p0": states["pl"][plot_indices] - states["p0"][plot_indices],
+        }
+        projections = {
+            stage: _fit_pca(features) for stage, features in plot_states.items()
+        }
+        coordinates = {
+            stage: projections[stage].transform(features)
+            for stage, features in plot_states.items()
+        }
+        for stage, projection in projections.items():
+            metrics[
+                f"pair_monitor/pca_explained_variance/{process_name}/{stage}"
+            ] = sum(projection.explained_variance)
 
-    metrics = {
-        "pair_monitor/pca_explained_variance/raw": sum(
-            raw_pca.explained_variance
-        ),
-        "pair_monitor/pca_explained_variance/latent_joint": sum(
-            latent_pca.explained_variance
-        ),
+        figures[f"pca/{_safe_key(process_name)}"] = _plot_process_figure(
+            process_name=process_name,
+            coordinates=coordinates,
+            labels=plot_labels,
+            group_names=group_names,
+            projections=projections,
+            stage_scores=scores_by_process[process_name],
+            gains=gains_by_process[process_name],
+        )
+
+    figures["summary"] = _plot_summary_figure(
+        scores_by_process=scores_by_process,
+        gains_by_process=gains_by_process,
+    )
+    return figures, metrics
+
+
+def _balanced_plot_indices(
+    labels: Tensor,
+    scope: Tensor,
+    cap: int,
+    generator: torch.Generator,
+) -> Tensor:
+    """Select an equal visual sample per truth group without changing metrics."""
+
+    groups = torch.unique(labels[scope]).tolist()
+    if not groups:
+        return torch.empty(0, dtype=torch.long)
+    target = min(
+        cap,
+        min(int((scope & labels.eq(group)).sum()) for group in groups),
+    )
+    selected = []
+    for group in groups:
+        candidates = torch.nonzero(scope & labels.eq(group), as_tuple=False).flatten()
+        selected.append(_random_cap(candidates, target, generator))
+    return torch.cat(selected)
+
+
+def _plot_process_figure(
+    process_name: str,
+    coordinates: Mapping[str, Tensor],
+    labels: Tensor,
+    group_names: Mapping[int, str],
+    projections: Mapping[str, _PCAProjection],
+    stage_scores: Mapping[str, float],
+    gains: Mapping[str, float],
+) -> Figure:
+    figure = plt.figure(figsize=(7.2, 5.8), facecolor="white")
+    grid = figure.add_gridspec(
+        2,
+        4,
+        left=0.075,
+        right=0.985,
+        top=0.88,
+        bottom=0.20,
+        height_ratios=(2.5, 1.0),
+        hspace=0.55,
+        wspace=0.42,
+    )
+    group_styles = _group_styles(labels, group_names)
+    stage_titles = {
+        "raw": "Raw pair features",
+        "p0": "Initial latent P0",
+        "pl": "Updated latent PL",
+        "pl_minus_p0": "Latent update PL - P0",
     }
-    return figure, metrics
+    panel_letters = "abcdef"
+
+    for column, stage in enumerate(("raw", "p0", "pl", "pl_minus_p0")):
+        explained = sum(projections[stage].explained_variance)
+        _draw_pca_distribution(
+            figure=figure,
+            slot=grid[0, column],
+            coordinates=coordinates[stage],
+            labels=labels,
+            group_names=group_names,
+            group_styles=group_styles,
+            title=f"{stage_titles[stage]}\nPC1 + PC2 = {explained:.1%}",
+            panel_letter=panel_letters[column],
+        )
+
+    score_axis = figure.add_subplot(grid[1, :2])
+    _draw_stage_scores(score_axis, stage_scores, panel_letters[4])
+    gain_axis = figure.add_subplot(grid[1, 2:])
+    _draw_separation_gains(gain_axis, gains, panel_letters[5])
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            linestyle="none",
+            marker=marker,
+            markersize=4,
+            markerfacecolor=color if marker != "x" else "none",
+            markeredgecolor=color,
+            markeredgewidth=0.7,
+            label=group_names.get(group, f"group_{group}"),
+        )
+        for group, (color, marker) in group_styles.items()
+    ]
+    if handles:
+        figure.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.025),
+            ncol=min(6, len(handles)),
+            columnspacing=1.0,
+            handletextpad=0.35,
+            frameon=False,
+            fontsize=5.8,
+        )
+    figure.suptitle(
+        f"Pair-representation diagnostic | {process_name}",
+        x=0.075,
+        y=0.965,
+        ha="left",
+        fontsize=9,
+        fontweight="bold",
+    )
+    return figure
 
 
-def _coordinate_limits(coordinates: Tensor) -> tuple[tuple[float, float], tuple[float, float]]:
+def _draw_pca_distribution(
+    figure: Figure,
+    slot,
+    coordinates: Tensor,
+    labels: Tensor,
+    group_names: Mapping[int, str],
+    group_styles: Mapping[int, tuple[str, str]],
+    title: str,
+    panel_letter: str,
+) -> None:
+    nested = slot.subgridspec(
+        2,
+        2,
+        width_ratios=(4.0, 1.0),
+        height_ratios=(1.0, 4.0),
+        hspace=0.04,
+        wspace=0.04,
+    )
+    x_hist = figure.add_subplot(nested[0, 0])
+    scatter = figure.add_subplot(nested[1, 0])
+    y_hist = figure.add_subplot(nested[1, 1])
+    x_limits, y_limits = _coordinate_limits(coordinates)
+
+    x_hist.hist(
+        coordinates[:, 0],
+        bins=22,
+        range=x_limits,
+        density=True,
+        color="#D9DDE2",
+        edgecolor="none",
+    )
+    y_hist.hist(
+        coordinates[:, 1],
+        bins=22,
+        range=y_limits,
+        density=True,
+        orientation="horizontal",
+        color="#D9DDE2",
+        edgecolor="none",
+    )
+
+    for group, (color, marker) in group_styles.items():
+        draw = labels.eq(group)
+        if not draw.any():
+            continue
+        points = coordinates[draw]
+        group_name = group_names.get(group, f"group_{group}")
+        scatter.scatter(
+            points[:, 0],
+            points[:, 1],
+            s=7,
+            alpha=0.48,
+            color=color,
+            marker=marker,
+            linewidths=0.45,
+            rasterized=True,
+            label=group_name,
+        )
+        x_hist.hist(
+            points[:, 0],
+            bins=22,
+            range=x_limits,
+            density=True,
+            histtype="step",
+            color=color,
+            linewidth=0.55,
+            alpha=0.75,
+        )
+        y_hist.hist(
+            points[:, 1],
+            bins=22,
+            range=y_limits,
+            density=True,
+            histtype="step",
+            orientation="horizontal",
+            color=color,
+            linewidth=0.55,
+            alpha=0.75,
+        )
+
+    scatter.set(xlim=x_limits, ylim=y_limits, xlabel="PC1", ylabel="PC2")
+    scatter.spines[["top", "right"]].set_visible(False)
+    scatter.tick_params(direction="out", length=2.5, pad=1.5)
+    scatter.axhline(0.0, color="#D6D6D6", linewidth=0.45, zorder=0)
+    scatter.axvline(0.0, color="#D6D6D6", linewidth=0.45, zorder=0)
+    x_hist.set_title(title, fontsize=7, pad=3)
+    x_hist.set_xlim(x_limits)
+    y_hist.set_ylim(y_limits)
+    for marginal in (x_hist, y_hist):
+        marginal.set_xticks([])
+        marginal.set_yticks([])
+        for spine in marginal.spines.values():
+            spine.set_visible(False)
+    x_hist.text(
+        -0.18,
+        1.10,
+        panel_letter,
+        transform=x_hist.transAxes,
+        fontsize=9,
+        fontweight="bold",
+        va="top",
+    )
+
+
+def _draw_stage_scores(axis, stage_scores: Mapping[str, float], letter: str) -> None:
+    stages = ("raw", "p0", "pl")
+    values = [stage_scores[stage] for stage in stages]
+    bars = axis.bar(
+        range(3),
+        values,
+        width=0.62,
+        color=[_STAGE_COLORS[stage] for stage in stages],
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    axis.set_xticks(range(3), ("Raw", "P0", "PL"))
+    axis.set_ylim(0.0, 1.0)
+    axis.set_ylabel("Centroid separation")
+    axis.set_title("Truth-group separation", fontsize=7, pad=4)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.tick_params(direction="out", length=2.5)
+    for bar, value in zip(bars, values):
+        if math.isfinite(value):
+            axis.text(
+                bar.get_x() + bar.get_width() / 2,
+                min(value + 0.025, 0.96),
+                f"{value:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=6,
+            )
+    _add_panel_label(axis, letter)
+
+
+def _draw_separation_gains(axis, gains: Mapping[str, float], letter: str) -> None:
+    names = ("pl_minus_p0", "pl_minus_raw")
+    values = [gains[name] for name in names]
+    colors = ["#348A64" if value >= 0 else "#B54A4A" for value in values]
+    bars = axis.bar(range(2), values, width=0.58, color=colors)
+    finite_values = [abs(value) for value in values if math.isfinite(value)]
+    limit = max(finite_values + [0.01]) * 1.35
+    axis.set_ylim(-limit, limit)
+    axis.set_xticks(range(2), ("PL - P0", "PL - raw"))
+    axis.set_ylabel("Separation gain")
+    axis.set_title("Signed improvement", fontsize=7, pad=4)
+    axis.axhline(0.0, color="#333333", linewidth=0.7)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.tick_params(direction="out", length=2.5)
+    for bar, value in zip(bars, values):
+        if math.isfinite(value):
+            offset = 0.05 * limit if value >= 0 else -0.05 * limit
+            axis.text(
+                bar.get_x() + bar.get_width() / 2,
+                value + offset,
+                f"{value:+.3f}",
+                ha="center",
+                va="bottom" if value >= 0 else "top",
+                fontsize=6,
+            )
+    _add_panel_label(axis, letter)
+
+
+def _plot_summary_figure(
+    scores_by_process: Mapping[str, Mapping[str, float]],
+    gains_by_process: Mapping[str, Mapping[str, float]],
+) -> Figure:
+    process_names = [name for name in scores_by_process if name != "all"]
+    figure, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), facecolor="white")
+    figure.subplots_adjust(left=0.08, right=0.98, top=0.78, bottom=0.20, wspace=0.34)
+
+    score_axis, gain_axis = axes
+    for index, stage in enumerate(("raw", "p0", "pl")):
+        values = _finite_values(
+            scores_by_process[name][stage] for name in process_names
+        )
+        _draw_distribution_column(
+            score_axis,
+            index,
+            values,
+            _STAGE_COLORS[stage],
+        )
+        all_value = scores_by_process.get("all", {}).get(stage, float("nan"))
+        if math.isfinite(all_value):
+            score_axis.scatter(
+                index,
+                all_value,
+                s=35,
+                marker="D",
+                facecolor="white",
+                edgecolor="#111111",
+                linewidth=0.9,
+                zorder=4,
+            )
+    score_axis.set_xticks(range(3), ("Raw", "P0", "PL"))
+    score_axis.set_ylabel("Centroid separation")
+    score_axis.set_ylim(0.0, 1.0)
+    score_axis.set_title("Distribution across processes", fontsize=8, pad=5)
+    _style_summary_axis(score_axis, "a")
+
+    gain_specs = (("pl_minus_p0", "PL - P0"), ("pl_minus_raw", "PL - raw"))
+    for index, (gain_name, _) in enumerate(gain_specs):
+        values = _finite_values(
+            gains_by_process[name][gain_name] for name in process_names
+        )
+        _draw_signed_distribution_column(gain_axis, index, values)
+        all_value = gains_by_process.get("all", {}).get(gain_name, float("nan"))
+        if math.isfinite(all_value):
+            gain_axis.scatter(
+                index,
+                all_value,
+                s=35,
+                marker="D",
+                facecolor="white",
+                edgecolor="#111111",
+                linewidth=0.9,
+                zorder=4,
+            )
+    gain_axis.set_xticks(range(2), [label for _, label in gain_specs])
+    gain_axis.set_ylabel("Separation gain")
+    gain_axis.axhline(0.0, color="#333333", linewidth=0.7)
+    gain_axis.set_title("Signed update gains", fontsize=8, pad=5)
+    _style_summary_axis(gain_axis, "b")
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="none", color="#777777", markersize=4),
+        Line2D(
+            [0],
+            [0],
+            marker="D",
+            linestyle="none",
+            markerfacecolor="white",
+            markeredgecolor="#111111",
+            markersize=4.5,
+        ),
+    ]
+    figure.legend(
+        legend_handles,
+        ("Individual process", "All pairs"),
+        loc="lower center",
+        ncol=2,
+        frameon=False,
+        fontsize=6,
+    )
+    figure.suptitle(
+        f"Pair-representation summary | {len(process_names)} processes",
+        x=0.08,
+        y=0.96,
+        ha="left",
+        fontsize=9,
+        fontweight="bold",
+    )
+    return figure
+
+
+def _draw_distribution_column(axis, position: int, values: list[float], color: str) -> None:
+    if not values:
+        return
+    jitter = _deterministic_jitter(len(values), position)
+    axis.scatter(jitter, values, s=13, color=color, alpha=0.65, linewidth=0)
+    median = float(torch.tensor(values).median())
+    axis.plot(
+        [position - 0.18, position + 0.18],
+        [median, median],
+        color="#111111",
+        linewidth=1.1,
+        zorder=3,
+    )
+
+
+def _draw_signed_distribution_column(axis, position: int, values: list[float]) -> None:
+    if not values:
+        return
+    jitter = _deterministic_jitter(len(values), position)
+    colors = ["#348A64" if value >= 0 else "#B54A4A" for value in values]
+    axis.scatter(jitter, values, s=13, color=colors, alpha=0.72, linewidth=0)
+    median = float(torch.tensor(values).median())
+    axis.plot(
+        [position - 0.18, position + 0.18],
+        [median, median],
+        color="#111111",
+        linewidth=1.1,
+        zorder=3,
+    )
+
+
+def _deterministic_jitter(count: int, position: int) -> list[float]:
+    if count == 1:
+        return [float(position)]
+    offsets = torch.linspace(-0.16, 0.16, count)
+    return (offsets + position).tolist()
+
+
+def _finite_values(values) -> list[float]:
+    return [float(value) for value in values if math.isfinite(float(value))]
+
+
+def _style_summary_axis(axis, panel_letter: str) -> None:
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.tick_params(direction="out", length=2.5)
+    _add_panel_label(axis, panel_letter)
+
+
+def _add_panel_label(axis, letter: str) -> None:
+    axis.text(
+        -0.14,
+        1.08,
+        letter,
+        transform=axis.transAxes,
+        fontsize=9,
+        fontweight="bold",
+        va="top",
+    )
+
+
+def _group_styles(
+    labels: Tensor,
+    group_names: Mapping[int, str],
+) -> dict[int, tuple[str, str]]:
+    groups = sorted(int(group) for group in torch.unique(labels).tolist())
+    regular = [
+        group
+        for group in groups
+        if group_names.get(group, f"group_{group}") not in _SPECIAL_STYLES
+    ]
+    colors = {
+        group: _GROUP_COLORS[index % len(_GROUP_COLORS)]
+        for index, group in enumerate(regular)
+    }
+    return {
+        group: _SPECIAL_STYLES.get(
+            group_names.get(group, f"group_{group}"),
+            (colors.get(group, _GROUP_COLORS[0]), "o"),
+        )
+        for group in groups
+    }
+
+
+def _safe_key(name: str) -> str:
+    return "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in name
+    )
+
+
+def _coordinate_limits(
+    coordinates: Tensor,
+) -> tuple[tuple[float, float], tuple[float, float]]:
     limits = []
     for dimension in range(2):
-        lower = float(coordinates[:, dimension].min())
-        upper = float(coordinates[:, dimension].max())
+        values = coordinates[:, dimension]
+        lower = float(torch.quantile(values, 0.01))
+        upper = float(torch.quantile(values, 0.99))
         padding = max(0.05 * (upper - lower), 0.1)
         limits.append((lower - padding, upper + padding))
     return limits[0], limits[1]
