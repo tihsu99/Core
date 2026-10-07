@@ -12,6 +12,7 @@ from evenet.network.body.object_encoder import ObjectEncoder
 from evenet.network.heads.classification.classification_head import ClassificationHead, RegressionHead
 from evenet.network.heads.assignment.assignment_head import SharedAssignmentHead
 from evenet.network.heads.generation.generation_head import GlobalCondGenerationHead, EventGenerationHead
+from evenet.network.heads.pair_contrastive.pair_contrastive_head import PairContrastiveHead
 from evenet.network.heads.segmentation.segmentation_head import SegmentationHead
 from evenet.utilities.diffusion_sampler import get_logsnr_alpha_sigma
 from evenet.network.layers.debug_layer import PointCloudTransformer
@@ -187,6 +188,23 @@ class EveNetModel(nn.Module):
             use_object_to_pair=pet_config.get("use_object_to_pair", False),
             norm_type=pet_config.get("norm_type", "DynamicTanh"),
         )
+
+        pair_contrastive_cfg = self.options.Training.Components.get(
+            "PairContrastive", {}
+        )
+        if pair_contrastive_cfg.get("include", False):
+            if not self.enable_pair_creator or pet_config.get("attention_bias_type") != "IterativeUpdate":
+                raise ValueError(
+                    "PairContrastive requires PairCreator and "
+                    "PET.attention_bias_type='IterativeUpdate'"
+                )
+            self.PairContrastive = PairContrastiveHead(
+                pair_dim=int(pet_config.pair_dim),
+                projection_dim=int(pair_contrastive_cfg.get("projection_dim", 128)),
+                symmetrize_pair=bool(
+                    pair_contrastive_cfg.get("symmetrize_pair", True)
+                ),
+            )
 
         # [2] Classification + Regression + Assignment Body
         obj_encoder_cfg = self.network_cfg.Body.ObjectEncoder
