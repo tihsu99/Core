@@ -1,5 +1,6 @@
 """Rank-local validation diagnostics using the contrastive loss truth rules."""
 
+from fnmatch import fnmatchcase
 from typing import Mapping
 
 import matplotlib.pyplot as plt
@@ -21,6 +22,13 @@ _GROUPS = {
     "endpoint_negative": ("Endpoint negative", "#C44E52", "-."),
     "random_negative": ("Random negative", "#D9772A", ":"),
 }
+
+_DEFAULT_SCALAR_METRICS = (
+    "num_local_pairs",
+    "embedding/*",
+    "cosine/*/num_valid_anchors",
+    "cosine/*/z/*_mean",
+)
 
 
 def embedding_statistics(features: Tensor) -> dict[str, float]:
@@ -100,6 +108,15 @@ class PairContrastiveMonitor:
         self.max_embeddings = int(config.get("max_embedding_samples", 2048))
         self.bins = int(config.get("histogram_bins", 40))
         self.seed = int(config.get("random_seed", 12345))
+        self.scalar_metrics = config.get("scalar_metrics", _DEFAULT_SCALAR_METRICS)
+        self.cross_process_categories = config.get("cross_process_categories", [])
+        self.log_cross_process_table = bool(config.get("log_cross_process_table", False))
+        for name in ("scalar_metrics", "cross_process_categories"):
+            patterns = getattr(self, name)
+            if isinstance(patterns, str) or not isinstance(patterns, (list, tuple)) or any(
+                not isinstance(pattern, str) for pattern in patterns
+            ):
+                raise ValueError(f"PairContrastive monitor {name} must be a list of glob patterns")
         if min(self.every_n_epochs, self.max_anchors, self.chunk_size, self.bins) < 1:
             raise ValueError("PairContrastive monitor intervals and caps must be positive")
         if self.max_embeddings < 2:
@@ -122,7 +139,7 @@ class PairContrastiveMonitor:
         batch, i, j = (selected[key] for key in ("batch", "i", "j"))
         metrics = {"pair_contrastive/num_local_pairs": float(batch.numel())}
         if batch.numel() == 0:
-            return PairMonitorResult(metrics=metrics, rows=[], figures={})
+            return PairMonitorResult(metrics=self._select_metrics(metrics), rows=[], figures={})
         if z.ndim != 2 or z.shape[0] != batch.numel():
             raise ValueError("Contrastive monitor z and selected pairs must align")
 
@@ -157,12 +174,22 @@ class PairContrastiveMonitor:
             for category in local["categories"][bonds, level].unique().tolist():
                 keep = bonds & local["categories"][:, level].eq(category)
                 category_name = self.category_names.get(category, str(category))
+                if not any(fnmatchcase(category_name, pattern) for pattern in self.cross_process_categories):
+                    continue
                 key = f"pair_contrastive/cross_process/{name}/{category_name}"
                 figures[key] = self._process_figure(
                     normalized, local["event"], processes, keep,
                     name, category_name, rows, metrics,
                 )
-        return PairMonitorResult(metrics=metrics, rows=rows, figures=figures)
+        return PairMonitorResult(metrics=self._select_metrics(metrics), rows=rows, figures=figures)
+
+    def _select_metrics(self, metrics):
+        """Filter scalar output before it reaches any logger or dashboard."""
+        return {
+            key: value for key, value in metrics.items()
+            if any(fnmatchcase(key.removeprefix("pair_contrastive/"), pattern)
+                   for pattern in self.scalar_metrics)
+        }
 
     def _cosine_figure(
         self, states, local, anchors, level, name, generator, metrics,
@@ -242,11 +269,12 @@ class PairContrastiveMonitor:
                     mean = float(means[a, b]) if count else None
                     label = f"{mean:.2f}\nn={count:,}" if count else "N/A\nn=0"
                     axis.text(b, a, label, ha="center", va="center", fontsize=max(5, 8 - size // 6))
-                    rows.append({
-                        "level": level_name, "category": category_name, "stage": stage,
-                        "anchor_process": source, "candidate_process": target,
-                        "count": count, "mean_cosine": mean,
-                    })
+                    if self.log_cross_process_table:
+                        rows.append({
+                            "level": level_name, "category": category_name, "stage": stage,
+                            "anchor_process": source, "candidate_process": target,
+                            "count": count, "mean_cosine": mean,
+                        })
             off_diagonal = ~torch.eye(size, dtype=torch.bool)
             cross_count = int(counts[off_diagonal].sum())
             prefix = f"pair_contrastive/cross_process/{level_name}/{category_name}/{stage}"

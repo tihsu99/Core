@@ -4,8 +4,8 @@ The monitor is intentionally stateless. Run it on an occasional, fixed
 validation batch instead of accumulating tensors throughout an epoch.
 """
 
-import math
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import Mapping, Optional
 
 import matplotlib.pyplot as plt
@@ -28,7 +28,6 @@ _PUBLICATION_STYLE = {
 }
 _FIGURE_DPI = 200
 
-_STAGE_COLORS = {"raw": "#6F7782", "p0": "#4C78A8", "pl": "#D9772A"}
 _GROUP_COLORS = (
     "#3569A8",
     "#D9772A",
@@ -223,6 +222,8 @@ class PairRepresentationMonitor:
         include_all_processes: bool = True,
         plot_max_pairs_per_group: int = 128,
         sync_distributed: bool = True,
+        process_plots: tuple[str, ...] | list[str] = (),
+        plot_stages: tuple[str, ...] | list[str] = ("raw", "pl", "pl_minus_p0"),
     ) -> None:
         if (
             max_pairs_per_process_group < 1
@@ -236,6 +237,18 @@ class PairRepresentationMonitor:
         self.include_all_processes = include_all_processes
         self.plot_max_pairs_per_group = plot_max_pairs_per_group
         self.sync_distributed = sync_distributed
+        if not isinstance(process_plots, (list, tuple)) or any(
+            not isinstance(name, str) for name in process_plots
+        ):
+            raise ValueError("process_plots must be a list of process-name glob patterns")
+        if (
+            not isinstance(plot_stages, (list, tuple)) or not plot_stages
+            or any(stage not in ("raw", "p0", "pl", "pl_minus_p0") for stage in plot_stages)
+            or len(set(plot_stages)) != len(plot_stages)
+        ):
+            raise ValueError("plot_stages must be a nonempty, unique list of raw, p0, pl, pl_minus_p0")
+        self.process_plots = tuple(process_plots)
+        self.plot_stages = tuple(plot_stages)
 
     @torch.no_grad()
     def __call__(
@@ -317,60 +330,37 @@ class PairRepresentationMonitor:
         process_scopes.extend(
             (name_map.get(int(process_id), f"process_{int(process_id)}"), int(process_id))
             for process_id in present_processes
+            if any(fnmatchcase(name_map.get(int(process_id), f"process_{int(process_id)}"), pattern)
+                   for pattern in self.process_plots)
         )
 
         metrics: dict[str, float] = {}
-        rows: list[dict[str, object]] = []
-        scores_by_process: dict[str, dict[str, float]] = {}
-        gains_by_process: dict[str, dict[str, float]] = {}
-        for process_name, process_id in process_scopes:
-            scope = (
-                torch.ones_like(selected_processes, dtype=torch.bool)
-                if process_id is None
-                else selected_processes.eq(process_id)
-            )
-            num_groups = int(torch.unique(selected_labels[scope]).numel())
-            stage_scores = {}
-            for stage_name, state in selected_states.items():
-                score = centroid_separation_score(state[scope], selected_labels[scope])
-                stage_scores[stage_name] = score
-                metrics[f"pair_monitor/separation/{process_name}/{stage_name}"] = score
-                rows.append(
-                    {
-                        "process": process_name,
-                        "stage": stage_name,
-                        "separation": score,
-                        "num_pairs": int(scope.sum()),
-                        "num_groups": num_groups,
-                    }
-                )
-            gains = {
-                "p0_minus_raw": stage_scores["p0"] - stage_scores["raw"],
-                "pl_minus_p0": stage_scores["pl"] - stage_scores["p0"],
-                "pl_minus_raw": stage_scores["pl"] - stage_scores["raw"],
+        if self.include_all_processes:
+            # Pool the selected pairs before computing scores, not process-wise scores.
+            scores = {
+                stage: centroid_separation_score(state, selected_labels)
+                for stage, state in selected_states.items()
             }
-            scores_by_process[process_name] = stage_scores
-            gains_by_process[process_name] = gains
-            metrics.update(
-                {
-                    f"pair_monitor/separation_gain/{process_name}/{gain_name}": value
-                    for gain_name, value in gains.items()
-                }
-            )
+            metrics = {
+                "pair_monitor/separation/all/raw": scores["raw"],
+                "pair_monitor/separation/all/pl": scores["pl"],
+                "pair_monitor/separation_gain/all/pl_minus_p0": scores["pl"] - scores["p0"],
+                "pair_monitor/separation_gain/all/pl_minus_raw": scores["pl"] - scores["raw"],
+                "pair_monitor/num_pairs": float(selected_labels.numel()),
+                "pair_monitor/num_groups": float(selected_labels.unique().numel()),
+            }
 
-        figures, pca_metrics = _plot_publication_figures(
+        figures = _plot_publication_figures(
             states=selected_states,
             labels=selected_labels,
             processes=selected_processes,
             process_scopes=process_scopes,
             group_names=groups.names,
-            scores_by_process=scores_by_process,
-            gains_by_process=gains_by_process,
+            plot_stages=self.plot_stages,
             plot_max_pairs_per_group=self.plot_max_pairs_per_group,
             random_seed=self.random_seed,
         )
-        metrics.update(pca_metrics)
-        return PairMonitorResult(metrics=metrics, rows=rows, figures=figures)
+        return PairMonitorResult(metrics=metrics, rows=[], figures=figures)
 
     def _reduce_across_ranks(
         self,
@@ -533,92 +523,45 @@ def _plot_publication_figures(
     processes: Tensor,
     process_scopes: list[tuple[str, Optional[int]]],
     group_names: Mapping[int, str],
-    scores_by_process: Mapping[str, Mapping[str, float]],
-    gains_by_process: Mapping[str, Mapping[str, float]],
+    plot_stages: tuple[str, ...],
     plot_max_pairs_per_group: int,
     random_seed: int,
-) -> tuple[dict[str, Figure], dict[str, float]]:
-    """Build one paper-style figure per process and one compact summary."""
-
-    with plt.rc_context(_PUBLICATION_STYLE):
-        return _build_publication_figures(
-            states=states,
-            labels=labels,
-            processes=processes,
-            process_scopes=process_scopes,
-            group_names=group_names,
-            scores_by_process=scores_by_process,
-            gains_by_process=gains_by_process,
-            plot_max_pairs_per_group=plot_max_pairs_per_group,
-            random_seed=random_seed,
-        )
-
-
-def _build_publication_figures(
-    states: Mapping[str, Tensor],
-    labels: Tensor,
-    processes: Tensor,
-    process_scopes: list[tuple[str, Optional[int]]],
-    group_names: Mapping[int, str],
-    scores_by_process: Mapping[str, Mapping[str, float]],
-    gains_by_process: Mapping[str, Mapping[str, float]],
-    plot_max_pairs_per_group: int,
-    random_seed: int,
-) -> tuple[dict[str, Figure], dict[str, float]]:
-
+) -> dict[str, Figure]:
+    """One pooled overview, plus only requested process update distributions."""
     figures: dict[str, Figure] = {}
-    metrics: dict[str, float] = {}
     generator = torch.Generator().manual_seed(random_seed)
-
-    for process_name, process_id in process_scopes:
-        scope = (
-            torch.ones_like(processes, dtype=torch.bool)
-            if process_id is None
-            else processes.eq(process_id)
-        )
-        plot_indices = _balanced_plot_indices(
-            labels,
-            scope,
-            plot_max_pairs_per_group,
-            generator,
-        )
-        plot_labels = labels[plot_indices]
-        plot_states = {
-            "raw": states["raw"][plot_indices],
-            "p0": states["p0"][plot_indices],
-            "pl": states["pl"][plot_indices],
-            "pl_minus_p0": states["pl"][plot_indices] - states["p0"][plot_indices],
-        }
-        projections = {
-            stage: _fit_pca(features) for stage, features in plot_states.items()
-        }
-        coordinates = {
-            stage: projections[stage].transform(features)
-            for stage, features in plot_states.items()
-        }
-        for stage, projection in projections.items():
-            metrics[
-                f"pair_monitor/pca_explained_variance/{process_name}/{stage}"
-            ] = sum(projection.explained_variance)
-
-        pca_figure, metrics_figure = _plot_process_figures(
-            process_name=process_name,
-            coordinates=coordinates,
-            labels=plot_labels,
-            group_names=group_names,
-            projections=projections,
-            stage_scores=scores_by_process[process_name],
-            gains=gains_by_process[process_name],
-        )
-        safe_process_name = _safe_key(process_name)
-        figures[f"pca/{safe_process_name}"] = pca_figure
-        figures[f"metrics/{safe_process_name}"] = metrics_figure
-
-    figures["summary"] = _plot_summary_figure(
-        scores_by_process=scores_by_process,
-        gains_by_process=gains_by_process,
-    )
-    return figures, metrics
+    with plt.rc_context(_PUBLICATION_STYLE):
+        for process_name, process_id in process_scopes:
+            scope = (
+                torch.ones_like(processes, dtype=torch.bool)
+                if process_id is None
+                else processes.eq(process_id)
+            )
+            plot_indices = _balanced_plot_indices(
+                labels, scope, plot_max_pairs_per_group, generator,
+            )
+            stages = plot_stages if process_id is None else ("pl_minus_p0",)
+            plot_states = {
+                stage: (states["pl"][plot_indices] - states["p0"][plot_indices])
+                if stage == "pl_minus_p0" else states[stage][plot_indices]
+                for stage in stages
+            }
+            projections = {
+                stage: _fit_pca(features) for stage, features in plot_states.items()
+            }
+            coordinates = {
+                stage: projections[stage].transform(features)
+                for stage, features in plot_states.items()
+            }
+            # Explained variance stays in panel titles instead of separate metrics.
+            figures[f"pca/{_safe_key(process_name)}"] = _plot_process_figure(
+                process_name=process_name,
+                coordinates=coordinates,
+                labels=labels[plot_indices],
+                group_names=group_names,
+                projections=projections,
+            )
+    return figures
 
 
 def _balanced_plot_indices(
@@ -643,22 +586,21 @@ def _balanced_plot_indices(
     return torch.cat(selected)
 
 
-def _plot_process_figures(
+def _plot_process_figure(
     process_name: str,
     coordinates: Mapping[str, Tensor],
     labels: Tensor,
     group_names: Mapping[int, str],
     projections: Mapping[str, _PCAProjection],
-    stage_scores: Mapping[str, float],
-    gains: Mapping[str, float],
-) -> tuple[Figure, Figure]:
-    figure = plt.figure(figsize=(12.0, 3.8), dpi=_FIGURE_DPI, facecolor="white")
+) -> Figure:
+    stages = tuple(coordinates)
+    figure = plt.figure(figsize=(3.6 * len(stages) + 0.4, 3.8), dpi=_FIGURE_DPI, facecolor="white")
     grid = figure.add_gridspec(
         1,
-        4,
-        left=0.075,
+        len(stages),
+        left=0.075 if len(stages) > 1 else 0.16,
         right=0.985,
-        top=0.88,
+        top=0.80,
         bottom=0.18,
         wspace=0.42,
     )
@@ -671,7 +613,7 @@ def _plot_process_figures(
     }
     panel_letters = "abcd"
 
-    for column, stage in enumerate(("raw", "p0", "pl", "pl_minus_p0")):
+    for column, stage in enumerate(stages):
         explained = sum(projections[stage].explained_variance)
         _draw_pca_distribution(
             figure=figure,
@@ -703,37 +645,21 @@ def _plot_process_figures(
             handles=handles,
             loc="lower center",
             bbox_to_anchor=(0.5, 0.025),
-            ncol=min(6, len(handles)),
+            ncol=min(6 if len(stages) > 1 else 3, len(handles)),
             columnspacing=1.0,
             handletextpad=0.35,
             frameon=False,
             fontsize=5.8,
         )
     figure.suptitle(
-        f"Pair-representation diagnostic | {process_name}",
+        f"Pair representations | {process_name}",
         x=0.075,
         y=0.965,
         ha="left",
         fontsize=9,
         fontweight="bold",
     )
-    metrics_figure, axes = plt.subplots(
-        1, 2, figsize=(7.2, 3.2), dpi=_FIGURE_DPI, facecolor="white"
-    )
-    metrics_figure.subplots_adjust(
-        left=0.10, right=0.98, top=0.76, bottom=0.20, wspace=0.38
-    )
-    _draw_stage_scores(axes[0], stage_scores, "a")
-    _draw_separation_gains(axes[1], gains, "b")
-    metrics_figure.suptitle(
-        f"Pair-representation metrics | {process_name}",
-        x=0.10,
-        y=0.96,
-        ha="left",
-        fontsize=9,
-        fontweight="bold",
-    )
-    return figure, metrics_figure
+    return figure
 
 
 def _draw_pca_distribution(
@@ -834,137 +760,6 @@ def _draw_pca_distribution(
         1.10,
         panel_letter,
         transform=x_hist.transAxes,
-        fontsize=9,
-        fontweight="bold",
-        va="top",
-    )
-
-
-def _draw_stage_scores(axis, stage_scores: Mapping[str, float], letter: str) -> None:
-    stages = ("raw", "p0", "pl")
-    values = [stage_scores[stage] for stage in stages]
-    bars = axis.bar(
-        range(3),
-        values,
-        width=0.62,
-        color=[_STAGE_COLORS[stage] for stage in stages],
-        edgecolor="white",
-        linewidth=0.5,
-    )
-    axis.set_xticks(range(3), ("Raw", "P0", "PL"))
-    axis.set_ylim(0.0, 1.0)
-    axis.set_ylabel("Centroid separation")
-    axis.set_title("Truth-group separation", fontsize=7, pad=4)
-    axis.spines[["top", "right"]].set_visible(False)
-    axis.tick_params(direction="out", length=2.5)
-    for bar, value in zip(bars, values):
-        if math.isfinite(value):
-            axis.text(
-                bar.get_x() + bar.get_width() / 2,
-                min(value + 0.025, 0.96),
-                f"{value:.3f}",
-                ha="center",
-                va="bottom",
-                fontsize=6,
-            )
-    _add_panel_label(axis, letter)
-
-
-def _draw_separation_gains(axis, gains: Mapping[str, float], letter: str) -> None:
-    names = ("pl_minus_p0", "pl_minus_raw")
-    values = [gains[name] for name in names]
-    colors = ["#348A64" if value >= 0 else "#B54A4A" for value in values]
-    bars = axis.bar(range(2), values, width=0.58, color=colors)
-    finite_values = [abs(value) for value in values if math.isfinite(value)]
-    limit = max(finite_values + [0.01]) * 1.35
-    axis.set_ylim(-limit, limit)
-    axis.set_xticks(range(2), ("PL - P0", "PL - raw"))
-    axis.set_ylabel("Separation gain")
-    axis.set_title("Signed improvement", fontsize=7, pad=4)
-    axis.axhline(0.0, color="#333333", linewidth=0.7)
-    axis.spines[["top", "right"]].set_visible(False)
-    axis.tick_params(direction="out", length=2.5)
-    for bar, value in zip(bars, values):
-        if math.isfinite(value):
-            offset = 0.05 * limit if value >= 0 else -0.05 * limit
-            axis.text(
-                bar.get_x() + bar.get_width() / 2,
-                value + offset,
-                f"{value:+.3f}",
-                ha="center",
-                va="bottom" if value >= 0 else "top",
-                fontsize=6,
-            )
-    _add_panel_label(axis, letter)
-
-
-def _plot_summary_figure(
-    scores_by_process: Mapping[str, Mapping[str, float]],
-    gains_by_process: Mapping[str, Mapping[str, float]],
-) -> Figure:
-    process_names = [name for name in scores_by_process if name != "all"]
-    figure, axes = plt.subplots(
-        1, 2, figsize=(10.8, 3.4), dpi=_FIGURE_DPI, facecolor="white"
-    )
-    figure.subplots_adjust(left=0.07, right=0.99, top=0.78, bottom=0.28, wspace=0.28)
-
-    score_axis, gain_axis = axes
-    positions = torch.arange(len(process_names)).tolist()
-    score_width = 0.24
-    for offset, stage in zip((-score_width, 0.0, score_width), ("raw", "p0", "pl")):
-        score_axis.bar(
-            [position + offset for position in positions],
-            [scores_by_process[name][stage] for name in process_names],
-            width=score_width,
-            color=_STAGE_COLORS[stage],
-            label=stage.upper(),
-        )
-    score_axis.set_xticks(positions, process_names, rotation=25, ha="right")
-    score_axis.set_ylabel("Centroid separation")
-    score_axis.set_ylim(0.0, 1.0)
-    score_axis.set_title("Separation by process", fontsize=8, pad=5)
-    _style_summary_axis(score_axis, "a")
-    score_axis.legend(frameon=False, fontsize=6, ncol=3, loc="upper left")
-
-    gain_specs = (("pl_minus_p0", "PL - P0"), ("pl_minus_raw", "PL - raw"))
-    gain_width = 0.34
-    for offset, (gain_name, label) in zip((-gain_width / 2, gain_width / 2), gain_specs):
-        gain_axis.bar(
-            [position + offset for position in positions],
-            [gains_by_process[name][gain_name] for name in process_names],
-            width=gain_width,
-            color="#348A64" if gain_name == "pl_minus_p0" else "#D9772A",
-            label=label,
-        )
-    gain_axis.set_xticks(positions, process_names, rotation=25, ha="right")
-    gain_axis.set_ylabel("Separation gain")
-    gain_axis.axhline(0.0, color="#333333", linewidth=0.7)
-    gain_axis.set_title("Update gains by process", fontsize=8, pad=5)
-    _style_summary_axis(gain_axis, "b")
-    gain_axis.legend(frameon=False, fontsize=6, ncol=2, loc="upper left")
-    figure.suptitle(
-        f"Pair-representation summary | {len(process_names)} processes",
-        x=0.08,
-        y=0.96,
-        ha="left",
-        fontsize=9,
-        fontweight="bold",
-    )
-    return figure
-
-
-def _style_summary_axis(axis, panel_letter: str) -> None:
-    axis.spines[["top", "right"]].set_visible(False)
-    axis.tick_params(direction="out", length=2.5)
-    _add_panel_label(axis, panel_letter)
-
-
-def _add_panel_label(axis, letter: str) -> None:
-    axis.text(
-        -0.14,
-        1.08,
-        letter,
-        transform=axis.transAxes,
         fontsize=9,
         fontweight="bold",
         va="top",

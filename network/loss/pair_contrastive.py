@@ -361,6 +361,9 @@ class HierarchicalPairContrastiveLoss:
         self.temperature = float(config.get("temperature", 0.1))
         if self.temperature <= 0:
             raise ValueError("PairContrastive.temperature must be positive")
+        self.candidate_balance = config.get("candidate_balance", "none")
+        if self.candidate_balance not in ("none", "positive_negative"):
+            raise ValueError("PairContrastive.candidate_balance must be none or positive_negative")
         self.level_weights = config.get("level_weights", {})
         self.enabled_levels = tuple(
             config.get("enabled_levels", ("decay_system", "sibling"))
@@ -450,19 +453,15 @@ class HierarchicalPairContrastiveLoss:
                 build_contrastive_masks(local, index, level)
             )
             random_negative = self._sample_random_negatives(random_candidates)
-            denominator = positive | endpoint_negative | random_negative
-            valid = positive.any(dim=1) & (endpoint_negative | random_negative).any(dim=1)
+            negative = endpoint_negative | random_negative
+            valid = positive.any(dim=1) & negative.any(dim=1)
             if not valid.any():
                 continue
-            log_denominator = torch.logsumexp(
-                logits.masked_fill(~denominator, -torch.inf), dim=1
+            # Filter before logsumexp: empty groups must not produce NaN gradients.
+            per_anchor = self._anchor_losses(
+                logits[valid], positive[valid], negative[valid],
             )
-            log_probability = logits - log_denominator.unsqueeze(1)
-            per_anchor = -(
-                log_probability.masked_fill(~positive, 0.0).sum(dim=1)
-                / positive.sum(dim=1).clamp_min(1)
-            )
-            loss_sum = loss_sum + per_anchor[valid].sum()
+            loss_sum = loss_sum + per_anchor.sum()
             valid_count += int(valid.sum())
             counts["num_same_event_positives"] += (
                 positive[valid] & same_event[valid]
@@ -475,6 +474,36 @@ class HierarchicalPairContrastiveLoss:
 
         count = z.new_tensor(float(valid_count))
         return loss_sum / count.clamp_min(1.0), count, counts
+
+    def _anchor_losses(self, logits: Tensor, positive: Tensor, negative: Tensor) -> Tensor:
+        """Losses for anchors with nonempty, disjoint positive/negative groups.
+
+        positive_negative adapts BCL Eq. (6)'s group-count averaging to two
+        anchor-relative groups, not semantic classes; it is not full BCL.
+        Reference: https://arxiv.org/html/2207.09052v3#S3.SS3
+        """
+        if self.candidate_balance == "positive_negative":
+            # Keep log reductions stable under mixed precision without lowering float64.
+            if logits.dtype in (torch.float16, torch.bfloat16):
+                logits = logits.float()
+            positive_count = positive.sum(dim=1).to(logits.dtype)
+            negative_count = negative.sum(dim=1).to(logits.dtype)
+            log_positive_mean = torch.logsumexp(
+                logits.masked_fill(~positive, -torch.inf), dim=1,
+            ) - positive_count.log()
+            log_negative_mean = torch.logsumexp(
+                logits.masked_fill(~negative, -torch.inf), dim=1,
+            ) - negative_count.log()
+            log_denominator = torch.logaddexp(log_positive_mean, log_negative_mean)
+        else:
+            log_denominator = torch.logsumexp(
+                logits.masked_fill(~(positive | negative), -torch.inf), dim=1,
+            )
+        log_probability = logits - log_denominator.unsqueeze(1)
+        return -(
+            log_probability.masked_fill(~positive, 0.0).sum(dim=1)
+            / positive.sum(dim=1)
+        )
 
     def _sample_random_negatives(
         self, candidates: Tensor, generator: torch.Generator | None = None,

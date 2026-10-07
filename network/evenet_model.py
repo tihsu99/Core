@@ -226,6 +226,17 @@ class EveNetModel(nn.Module):
         # [3] Classification Head
         if self.include_classification:
             cls_cfg = self.network_cfg.Classification
+            use_classification_pairs = bool(cls_cfg.get("use_pair_representation", False))
+            if use_classification_pairs and (
+                not self.enable_pair_creator or pet_config.get("attention_bias_type") != "IterativeUpdate"
+            ):
+                raise ValueError(
+                    "Classification.use_pair_representation requires PairCreator and "
+                    "PET.attention_bias_type='IterativeUpdate'"
+                )
+            classification_pair_dim = pet_config.get("pair_dim")
+            if classification_pair_dim is None:
+                classification_pair_dim = pet_config.hidden_dim
             self.Classification = ClassificationHead(
                 input_dim=obj_encoder_cfg.hidden_dim,
                 class_label=self.event_info.class_label.get("EVENT", None),
@@ -235,6 +246,14 @@ class EveNetModel(nn.Module):
                 skip_connection=cls_cfg.skip_connection,
                 dropout=cls_cfg.dropout,
                 num_attention_heads=cls_cfg.num_attention_heads,
+                use_pair_representation=use_classification_pairs,
+                pair_dim=int(classification_pair_dim) if use_classification_pairs else None,
+                pair_attention_config={
+                    **{key: pet_config[key] for key in (
+                        "talking_head", "layer_scale", "layer_scale_init", "drop_probability", "norm_type",
+                    ) if key in pet_config},
+                    **cls_cfg.get("pair_attention", {}),
+                } if use_classification_pairs else None,
             )
         # [4] Regression Head
         if self.include_regression:
@@ -724,7 +743,9 @@ class EveNetModel(nn.Module):
                     classifications = self.Classification(
                         x = embeddings,
                         x_mask = full_input_point_cloud_mask,
-                        event_token=event_token
+                        event_token=event_token,
+                        pair_state=pair_output,
+                        pair_mask=pair_mask,
                     )
 
                 # Regression head

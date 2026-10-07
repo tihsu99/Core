@@ -7,7 +7,8 @@ import torch
 
 import numpy as np
 from evenet.network.layers.activation import  create_residual_connection
-from evenet.network.layers.transformer import ClassifierTransformerBlockModule
+from evenet.network.layers.transformer import ClassifierTransformerBlockModule, TransformerBlockModule
+from evenet.network.body.pairformer import PairToAttentionBias
 
 
 class BranchLinear(nn.Module):
@@ -107,6 +108,9 @@ class ClassificationHead(nn.Module):
             hidden_dim: int,
             dropout: float = 0.0,
             skip_connection: bool = False,
+            use_pair_representation: bool = False,
+            pair_dim: int | None = None,
+            pair_attention_config: dict | None = None,
     ):
         super(ClassificationHead, self).__init__()
 
@@ -130,17 +134,56 @@ class ClassificationHead(nn.Module):
                 skip_connection=skip_connection
             )
         self.networks = nn.ModuleDict(networks)
+        self.use_pair_representation = use_pair_representation
+        self.pair_dim = pair_dim
+        if use_pair_representation:
+            if pair_dim is None or pair_dim < 1:
+                raise ValueError("Classification pair_dim must be positive when using pair representations")
+            pair_cfg = pair_attention_config or {}
+            num_pair_layers = int(pair_cfg.get("num_layers", 1))
+            if num_pair_layers < 1:
+                raise ValueError("Classification.pair_attention.num_layers must be positive")
+            self.pair_attention_bias = PairToAttentionBias(pair_dim, num_attention_heads)
+            self.pair_attention_blocks = nn.ModuleList([
+                TransformerBlockModule(
+                    projection_dim=input_dim, num_heads=num_attention_heads, dropout=dropout,
+                    talking_head=bool(pair_cfg.get("talking_head", False)),
+                    layer_scale=bool(pair_cfg.get("layer_scale", True)),
+                    layer_scale_init=float(pair_cfg.get("layer_scale_init", 1.0e-5)),
+                    drop_probability=float(pair_cfg.get("drop_probability", 0.0)),
+                    norm_type=pair_cfg.get("norm_type", "DynamicTanh"),
+                ) for _ in range(num_pair_layers)
+            ])
 
-    def forward(self, x, x_mask, event_token) -> Dict[str, Tensor]:
+    def forward(self, x, x_mask, event_token, pair_state=None, pair_mask=None) -> Dict[str, Tensor]:
         """
-        :param x: input point cloud (batch_size, hidden_dim)
+        :param x: object embeddings [B, N, D].
+        :param pair_state: optional final ordered PL [B, N, N, pair_dim].
+        :param pair_mask: valid pair entries [B, N, N]; invalid entries have zero bias.
         :return: Dict[str, Tensor]
         """
-        class_token = event_token.clone()
+        if self.use_pair_representation:
+            if pair_state is None or pair_mask is None:
+                raise ValueError("Classification requires final PL and pair_mask when pair usage is enabled")
+            batch, objects = x.shape[:2]
+            if pair_state.shape != (batch, objects, objects, self.pair_dim):
+                raise ValueError("Classification pair_state must have shape [B, N, N, pair_dim]")
+            if pair_mask.shape != (batch, objects, objects) or x_mask.shape != (batch, objects, 1):
+                raise ValueError("Classification pair_mask and x_mask must match the input objects")
+            objects_valid = x_mask.squeeze(-1).bool()
+            valid = pair_mask.bool() & objects_valid[:, :, None] & objects_valid[:, None, :]
+            valid = valid & ~torch.eye(objects, dtype=torch.bool, device=valid.device)[None]
+            # Use PET's ordered, per-head additive bias without pooling PL or updating it.
+            safe_pairs = pair_state.masked_fill(~valid.unsqueeze(-1), 0.0)
+            bias = self.pair_attention_bias(safe_pairs, valid)
+            pair_objects = x
+            for block in self.pair_attention_blocks:
+                pair_objects = block(pair_objects, mask=x_mask, attn_bias=bias)
+            # Events without usable pairs retain the original classification path.
+            x = torch.where(valid.any(dim=(1, 2))[:, None, None], pair_objects, x)
+
         class_token = self.class_transformer(
-            x = x,
-            class_token = class_token,
-            mask = x_mask
+            x=x, class_token=event_token.clone(), mask=x_mask,
         )
         class_token = event_token + class_token
 
