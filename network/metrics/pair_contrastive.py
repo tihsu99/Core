@@ -28,6 +28,8 @@ _DEFAULT_SCALAR_METRICS = (
     "embedding/*",
     "cosine/*/num_valid_anchors",
     "cosine/*/z/*_mean",
+    "relation_subsets/*/num_valid_anchors",
+    "relation_subsets/*/*/positive_negative_gap",
 )
 
 
@@ -111,6 +113,17 @@ class PairContrastiveMonitor:
         self.scalar_metrics = config.get("scalar_metrics", _DEFAULT_SCALAR_METRICS)
         self.cross_process_categories = config.get("cross_process_categories", [])
         self.log_cross_process_table = bool(config.get("log_cross_process_table", False))
+        self.relation_subsets = config.get("relation_subsets", {})
+        if not isinstance(self.relation_subsets, Mapping):
+            raise ValueError("relation_subsets must map names to level/exclude definitions")
+        for name, subset in self.relation_subsets.items():
+            if not isinstance(name, str) or not name or "/" in name or not isinstance(subset, Mapping):
+                raise ValueError("relation_subsets requires nonempty names without '/' and mapping definitions")
+            excluded = subset.get("exclude", [])
+            if subset.get("level") not in LEVELS or not isinstance(excluded, (list, tuple)) or any(
+                level not in LEVELS for level in excluded
+            ):
+                raise ValueError("relation_subsets requires a known level and a list of known exclude levels")
         for name in ("scalar_metrics", "cross_process_categories"):
             patterns = getattr(self, name)
             if isinstance(patterns, str) or not isinstance(patterns, (list, tuple)) or any(
@@ -181,6 +194,19 @@ class PairContrastiveMonitor:
                     normalized, local["event"], processes, keep,
                     name, category_name, rows, metrics,
                 )
+        # Run optional slices after the original plots so their sampling stays unchanged.
+        for name, subset in self.relation_subsets.items():
+            level = LEVELS[subset["level"]]
+            keep = local["relations"][:, level] & local["categories"][:, level].ge(0)
+            for excluded in subset.get("exclude", []):
+                keep = keep & ~local["relations"][:, LEVELS[excluded]]
+            anchors = torch.nonzero(keep, as_tuple=True)[0]
+            anchors = anchors[torch.randperm(anchors.numel(), generator=generator)][:self.max_anchors]
+            prefix = f"pair_contrastive/relation_subsets/{name}"
+            figures[prefix] = self._cosine_figure(
+                normalized, local, anchors, level, name, generator, metrics,
+                positive_filter=keep, prefix=prefix,
+            )
         return PairMonitorResult(metrics=self._select_metrics(metrics), rows=rows, figures=figures)
 
     def _select_metrics(self, metrics):
@@ -193,6 +219,7 @@ class PairContrastiveMonitor:
 
     def _cosine_figure(
         self, states, local, anchors, level, name, generator, metrics,
+        positive_filter=None, prefix=None,
     ):
         histograms = {
             stage: {group: torch.zeros(self.bins) for group in _GROUPS}
@@ -204,6 +231,9 @@ class PairContrastiveMonitor:
             same_event, positive, endpoint, random_candidates = build_contrastive_masks(
                 local, index, level,
             )
+            if positive_filter is not None:
+                # Excluded positives stay neutral, never become artificial negatives.
+                positive = positive & positive_filter[None, :]
             random = self.criterion._sample_random_negatives(random_candidates, generator)
             valid = positive.any(dim=1) & (endpoint | random).any(dim=1)
             valid_count += int(valid.sum())
@@ -220,12 +250,21 @@ class PairContrastiveMonitor:
                     histograms[stage][group] += torch.histc(values, self.bins, -1, 1)
                     totals[stage][group] += values.double().sum().item()
 
-        prefix = f"pair_contrastive/cosine/{name}"
+        prefix = prefix or f"pair_contrastive/cosine/{name}"
         metrics[f"{prefix}/num_sampled_anchors"] = float(anchors.numel())
         metrics[f"{prefix}/num_valid_anchors"] = float(valid_count)
         figure, axes = plt.subplots(1, len(states), figsize=(10, 4.5), squeeze=False)
         edges = torch.linspace(-1, 1, self.bins + 1).numpy()
         for axis, stage in zip(axes[0], states):
+            positive_count = sum(int(histograms[stage][group].sum()) for group in
+                                 ("same_event_positive", "cross_event_positive"))
+            negative_count = sum(int(histograms[stage][group].sum()) for group in
+                                 ("endpoint_negative", "random_negative"))
+            if positive_count and negative_count:
+                metrics[f"{prefix}/{stage}/positive_negative_gap"] = (
+                    (totals[stage]["same_event_positive"] + totals[stage]["cross_event_positive"]) / positive_count
+                    - (totals[stage]["endpoint_negative"] + totals[stage]["random_negative"]) / negative_count
+                )
             for group, (label, color, style) in _GROUPS.items():
                 counts = histograms[stage][group]
                 count = int(counts.sum())

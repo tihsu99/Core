@@ -1,7 +1,7 @@
 import torch
 
 from evenet.network.body.embedding import LocalEmbeddingLayer, PETBody
-from evenet.network.body.pairformer import ObjectToPair
+from evenet.network.body.pairformer import ObjectToPair, PairUpdateBlock
 from evenet.network.layers.norm import DynamicTanh
 from evenet.network.layers.transformer import TransformerBlockModule
 
@@ -29,6 +29,7 @@ def make_pet(
     use_object_to_pair=False,
     talking_head=False,
     norm_type="DynamicTanh",
+    use_triangle_multiplication=True,
 ):
     return PETBody(
         num_feat=4,
@@ -53,6 +54,7 @@ def make_pet(
         use_triangle_attention=use_triangle_attention,
         use_object_to_pair=use_object_to_pair,
         norm_type=norm_type,
+        use_triangle_multiplication=use_triangle_multiplication,
     ).eval()
 
 
@@ -68,6 +70,42 @@ def make_inputs():
     pair = torch.randn(2, 4, 4, 3) * pair_mask.unsqueeze(-1)
     time = torch.zeros(2)
     return features, mask, pair, pair_mask, time
+
+
+def test_no_triangle_has_only_pairwise_updates_and_retains_gradients():
+    model = make_pet("IterativeUpdate", use_triangle_multiplication=False, use_object_to_pair=True)
+    for block in model.pair_update_blocks:
+        assert not hasattr(block, "outgoing_multiplication")
+        assert not hasattr(block, "incoming_multiplication")
+        assert not hasattr(block, "starting_node_attention")
+        pair = torch.randn(1, 3, 3, 8, requires_grad=True)
+        mask = ~torch.eye(3, dtype=torch.bool)[None]
+        changed = pair.detach().clone()
+        changed[:, 2, :, :] += 5
+        changed[:, :, 2, :] -= 3
+        output = block(pair, mask)
+        torch.testing.assert_close(output[:, 0, 1], block(changed, mask)[:, 0, 1])
+        assert torch.count_nonzero(output[~mask]) == 0
+        output.square().sum().backward()
+        assert torch.isfinite(pair.grad).all() and pair.grad.abs().sum() > 0
+
+    features, mask, pair, pair_mask, time = make_inputs()
+    output, pl, _ = model(features, features[..., :2], mask, time,
+                         pair_representation=pair, pair_mask=pair_mask)
+    (output.square().sum() + pl.square().sum()).backward()
+    assert torch.isfinite(output).all() and torch.isfinite(pl).all()
+    assert all(parameter.grad is not None for parameter in model.pair_update_blocks.parameters())
+
+
+def test_triangle_multiplication_default_preserves_state_and_outputs():
+    torch.manual_seed(51)
+    default = PairUpdateBlock(8, 2, use_triangle_attention=True)
+    torch.manual_seed(51)
+    explicit = PairUpdateBlock(8, 2, use_triangle_attention=True, use_triangle_multiplication=True)
+    assert default.state_dict().keys() == explicit.state_dict().keys()
+    pair = torch.randn(2, 3, 3, 8)
+    mask = torch.ones(2, 3, 3, dtype=torch.bool)
+    torch.testing.assert_close(default(pair, mask), explicit(pair, mask), rtol=0, atol=0)
 
 
 def test_k_zero_bypasses_local_knn():

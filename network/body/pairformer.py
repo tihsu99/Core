@@ -173,12 +173,15 @@ class PairTransition(nn.Module):
 
 
 class PairUpdateBlock(nn.Module):
-    """AlphaFold-inspired pair update with optional triangle attention."""
+    """Pair transition with independently optional triangle operations."""
 
-    def __init__(self, pair_dim: int, num_heads: int, use_triangle_attention: bool):
+    def __init__(self, pair_dim: int, num_heads: int, use_triangle_attention: bool,
+                 use_triangle_multiplication: bool = True):
         super().__init__()
-        self.outgoing_multiplication = TriangleMultiplication(pair_dim, outgoing=True)
-        self.incoming_multiplication = TriangleMultiplication(pair_dim, outgoing=False)
+        self.use_triangle_multiplication = use_triangle_multiplication
+        if use_triangle_multiplication:
+            self.outgoing_multiplication = TriangleMultiplication(pair_dim, outgoing=True)
+            self.incoming_multiplication = TriangleMultiplication(pair_dim, outgoing=False)
         self.use_triangle_attention = use_triangle_attention
 
         if use_triangle_attention:
@@ -192,10 +195,11 @@ class PairUpdateBlock(nn.Module):
         return pair * pair_mask.unsqueeze(-1).to(pair.dtype)
 
     def forward(self, pair: Tensor, pair_mask: Tensor) -> Tensor:
-        pair = pair + self.outgoing_multiplication(pair, pair_mask)
-        pair = self._apply_mask(pair, pair_mask)
-        pair = pair + self.incoming_multiplication(pair, pair_mask)
-        pair = self._apply_mask(pair, pair_mask)
+        if self.use_triangle_multiplication:
+            pair = pair + self.outgoing_multiplication(pair, pair_mask)
+            pair = self._apply_mask(pair, pair_mask)
+            pair = pair + self.incoming_multiplication(pair, pair_mask)
+            pair = self._apply_mask(pair, pair_mask)
 
         if self.use_triangle_attention:
             pair = pair + self.starting_node_attention(pair, pair_mask)

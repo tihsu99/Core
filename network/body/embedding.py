@@ -366,6 +366,7 @@ class PETBody(nn.Module):
             use_triangle_attention: bool = False,
             use_object_to_pair: bool = False,
             norm_type: str = "DynamicTanh",
+            use_triangle_multiplication: bool = True,
     ):
         super().__init__()
         if K < 0:
@@ -451,6 +452,7 @@ class PETBody(nn.Module):
                     pair_dim=pair_dim,
                     num_heads=pair_num_heads,
                     use_triangle_attention=use_triangle_attention,
+                    use_triangle_multiplication=use_triangle_multiplication,
                 )
                 for _ in range(num_layers)
             ])
