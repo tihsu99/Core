@@ -576,7 +576,10 @@ def shared_epoch_end(
     metrics_train: SegmentationMetrics,
     logger,
     prefix: str = "",
+    wandb_mode: str = "full",
 ):
+    if wandb_mode not in ("compact", "full"):
+        raise ValueError("Metrics.Segmentation.wandb_mode must be 'compact' or 'full'")
     metrics_valid.reduce_across_gpus()
     if metrics_train is not None:
         metrics_train.reduce_across_gpus()
@@ -592,25 +595,40 @@ def shared_epoch_end(
             f"{prefix}segmentation/CM-number": wandb.Image(fig_cm_num),
 
         })
-        fig_cm.clear()
-        fig_cm_num.clear()
-
-        for cluster_name in metrics_valid.clusters_label.keys():
-            fig_score, metrics_score = metrics_valid.plot_score_distributions(cluster_name, logy=True)
-            logger.log({f"{prefix}{cluster_name}-segmentation/distribution": wandb.Image(fig_score)})
-            logger.log({f"{prefix}{cluster_name}-segmentation/{label}": value for label, value in metrics_score.items()})
-            fig_score.clear()
+        plt.close(fig_cm)
+        plt.close(fig_cm_num)
 
         metrics, metrics_process = metrics_valid.compute_metrics()
-        for cluster_name in metrics:
-            for log, value in metrics[cluster_name].items():
-                logger.log({f"{prefix}{cluster_name}-segmentation/{log}": value})
+        if wandb_mode == "compact":
+            columns = sorted({name for values in metrics.values() for name in values})
+            logger.log({
+                f"{prefix}segmentation/classes": wandb.Table(
+                    columns=["class", *columns],
+                    data=[[name, *[values.get(column) for column in columns]]
+                          for name, values in metrics.items()],
+                ),
+                f"{prefix}segmentation/processes": wandb.Table(
+                    columns=["process", "objects", "event-purity", "cluster-purity"],
+                    data=[[process, str(count), values["event-purity"], values["cluster-purity"]]
+                          for process, counts in metrics_process.items() for count, values in counts.items()],
+                ),
+            })
+        else:
+            for cluster_name in metrics_valid.clusters_label.keys():
+                fig_score, metrics_score = metrics_valid.plot_score_distributions(cluster_name, logy=True)
+                logger.log({f"{prefix}{cluster_name}-segmentation/distribution": wandb.Image(fig_score)})
+                logger.log({f"{prefix}{cluster_name}-segmentation/{label}": value for label, value in metrics_score.items()})
+                plt.close(fig_score)
 
-        for process_label in metrics_process.keys():
-            for num_q in metrics_process[process_label].keys():
-                for log, value in metrics_process[process_label][num_q].items():
-                    if value > 0:
-                        logger.log({f"{prefix}{process_label}-segmentation/{num_q}obj/{log}": value})
+            for cluster_name in metrics:
+                for log, value in metrics[cluster_name].items():
+                    logger.log({f"{prefix}{cluster_name}-segmentation/{log}": value})
+
+            for process_label in metrics_process.keys():
+                for num_q in metrics_process[process_label].keys():
+                    for log, value in metrics_process[process_label][num_q].items():
+                        if value > 0:
+                            logger.log({f"{prefix}{process_label}-segmentation/{num_q}obj/{log}": value})
 
 
     metrics_valid.reset()
