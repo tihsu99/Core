@@ -7,6 +7,7 @@ from evenet.network.layers.invisible_input_projector import InvisibleInputProjec
 
 from evenet.network.body.normalizer import Normalizer
 from evenet.network.body.pair_creator import PairCreator
+from evenet.network.body.refinement import SegmentationPairHypothesis, sample_recycles
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
 from evenet.network.body.object_encoder import ObjectEncoder
 from evenet.network.heads.classification.classification_head import ClassificationHead, RegressionHead
@@ -365,6 +366,27 @@ class EveNetModel(nn.Module):
             self.neutrino_position_encode = self.network_cfg.TruthGeneration.neutrino_position_encode
 
         # [7] Segmentation Head
+        refinement_cfg = self.network_cfg.get("Refinement", {})
+        self.refinement_enabled = bool(refinement_cfg.get("enabled", False))
+        self.max_recycles = refinement_cfg.get("max_recycles", 2)
+        if self.refinement_enabled:
+            if type(self.max_recycles) is not int or self.max_recycles < 0:
+                raise ValueError("Refinement.max_recycles must be a non-negative integer")
+            if not self.include_segmentation:
+                raise ValueError("Refinement requires Training.Components.Segmentation.include=true")
+        use_segmentation_pairs = bool(self.network_cfg.get("Segmentation", {}).get(
+            "use_pair_representation", self.refinement_enabled
+        ))
+        if self.refinement_enabled and not use_segmentation_pairs:
+            raise ValueError("Refinement requires Segmentation.use_pair_representation=true")
+        if self.include_segmentation and use_segmentation_pairs and (
+            not self.enable_pair_creator or pet_config.get("attention_bias_type") != "IterativeUpdate"
+        ):
+            raise ValueError(
+                "Segmentation.use_pair_representation requires PairCreator and "
+                "PET.attention_bias_type='IterativeUpdate'"
+            )
+        segmentation_pair_dim = pet_config.get("pair_dim") or pet_config.hidden_dim
         if self.include_segmentation:
             self.Segmentation = SegmentationHead(
                 projection_dim=self.network_cfg.Segmentation.projection_dim,
@@ -378,6 +400,19 @@ class EveNetModel(nn.Module):
                 return_intermediate=self.network_cfg.Segmentation.return_intermediate,
                 norm_before=self.network_cfg.Segmentation.norm_before,
                 encode_event_token=self.network_cfg.Segmentation.encode_event_token,
+                use_pair_representation=use_segmentation_pairs,
+                pair_dim=segmentation_pair_dim if use_segmentation_pairs else None,
+                pair_attention_config={
+                    **{key: pet_config[key] for key in (
+                        "talking_head", "layer_scale", "layer_scale_init", "drop_probability", "norm_type",
+                    ) if key in pet_config},
+                    **self.network_cfg.Segmentation.get("pair_attention", {}),
+                } if use_segmentation_pairs else None,
+            )
+        if self.refinement_enabled:
+            # PET owns the feedback parameters so the existing body optimizer includes them.
+            self.PET.segmentation_feedback = SegmentationPairHypothesis(
+                len(self.event_info.segmentation_indices) + 1, segmentation_pair_dim
             )
 
         self.schedule_flags = [
@@ -422,6 +457,7 @@ class EveNetModel(nn.Module):
             progressive_params: dict = None,
             schedules: list[tuple[str, bool]] = None,
             return_pair_states: bool = False,
+            num_recycles: Optional[int] = None,
     ) -> dict[str, dict[Any, Any] | Any]:
         """
         🧋This is the core forward function of the model. Only modulized network is included.
@@ -555,6 +591,8 @@ class EveNetModel(nn.Module):
 
         outputs = dict()
         pair_representations = dict()
+        refinement_steps = {}
+        refinement_depth = None
         if schedules is None:
             schedules = self.schedule_flags
 
@@ -680,7 +718,7 @@ class EveNetModel(nn.Module):
                     input_point_cloud_mask,
                     torch.zeros_like(invisible_point_cloud_mask),
                 ], dim=1)
-            full_input_point_cloud, pair_output, pair_input = self.PET(
+            pet_inputs = dict(
                 input_features=full_input_point_cloud,
                 input_points=local_points,
                 mask=full_input_point_cloud_mask,
@@ -692,6 +730,19 @@ class EveNetModel(nn.Module):
                 local_mask=local_mask,
                 return_pair_states=return_pair_states,
             )
+            refined = None
+            if self.refinement_enabled and schedule_name == "deterministic":
+                refinement_depth = self.max_recycles if num_recycles is None else num_recycles
+                if type(refinement_depth) is not int or not 0 <= refinement_depth <= self.max_recycles:
+                    raise ValueError("num_recycles must be between zero and Refinement.max_recycles")
+                if self.training and num_recycles is None:
+                    refinement_depth = sample_recycles(self.max_recycles, full_input_point_cloud.device)
+                refined, refinement_steps = self._refine(
+                    pet_inputs, full_global_conditions, global_conditions_mask, refinement_depth,
+                )
+                full_input_point_cloud, pair_output, pair_input = refined["pet"]
+            else:
+                full_input_point_cloud, pair_output, pair_input = self.PET(**pet_inputs)
             if self.enable_pair_creator:
                 pair_representations[schedule_name]["p0"] = pair_input
                 pair_representations[schedule_name]["pl"] = pair_output
@@ -700,12 +751,15 @@ class EveNetModel(nn.Module):
                 ######################################
                 ## Embedding for deterministic task ##
                 ######################################
-                embeddings, embedded_global_conditions, event_token = self.ObjectEncoder(
-                    encoded_vectors=full_input_point_cloud,
-                    mask=full_input_point_cloud_mask,
-                    condition_vectors=full_global_conditions,
-                    condition_mask=global_conditions_mask
-                )
+                if refined is None:
+                    embeddings, embedded_global_conditions, event_token = self.ObjectEncoder(
+                        encoded_vectors=full_input_point_cloud,
+                        mask=full_input_point_cloud_mask,
+                        condition_vectors=full_global_conditions,
+                        condition_mask=global_conditions_mask
+                    )
+                else:
+                    embeddings, embedded_global_conditions, event_token = refined["objects"]
 
                 ########################################
                 ## Output Head for deterministic task ##
@@ -729,10 +783,12 @@ class EveNetModel(nn.Module):
 
                 segmentation_out = {}
                 if self.include_segmentation:
-                    segmentation_out = self.Segmentation(
+                    segmentation_out = refined["segmentation"] if refined is not None else self.Segmentation(
                         memory = embeddings,
                         memory_mask = full_input_point_cloud_mask,
-                        event_token = event_token
+                        event_token = event_token,
+                        pair_state=pair_output,
+                        pair_mask=pair_mask,
                     )
 
                     if segmentation_out.get("event-token", None) is not None:
@@ -802,7 +858,7 @@ class EveNetModel(nn.Module):
                     "mask": invisible_point_cloud_mask.contiguous()
                 }
 
-        return {
+        result = {
             "classification": outputs.get("deterministic", {}).get("classification", None),
             "regression": outputs.get("deterministic", {}).get("regression", None),
             "assignments": outputs.get("deterministic", {}).get("assignments", None),
@@ -818,6 +874,34 @@ class EveNetModel(nn.Module):
             "segmentation-mask": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_masks", None),
             "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None)
         }
+        if self.refinement_enabled:
+            result["refinement_steps"] = refinement_steps
+            result["refinement_depth"] = refinement_depth
+        return result
+
+    def _refine(self, pet_inputs, global_conditions, global_mask, num_recycles):
+        """Recycle predictions; only the last pass participates in backpropagation."""
+        previous = None
+        steps = {}
+        grad_enabled = torch.is_grad_enabled()
+        for depth in range(num_recycles + 1):
+            with torch.set_grad_enabled(grad_enabled and depth == num_recycles):
+                hypothesis = self.PET.segmentation_feedback(previous, pet_inputs["pair_mask"])
+                pet = self.PET(**pet_inputs, pair_hypothesis=hypothesis)
+                objects = self.ObjectEncoder(
+                    encoded_vectors=pet[0], mask=pet_inputs["mask"],
+                    condition_vectors=global_conditions, condition_mask=global_mask,
+                )
+                segmentation = self.Segmentation(
+                    memory=objects[0], memory_mask=pet_inputs["mask"],
+                    event_token=objects[2], pair_state=pet[1], pair_mask=pet_inputs["pair_mask"],
+                )
+            previous = {
+                key: segmentation[key].detach() for key in ("pred_logits", "pred_masks")
+            }
+            if not self.training:
+                steps[f"iteration_{depth}"] = previous
+        return {"pet": pet, "objects": objects, "segmentation": segmentation}, steps
 
     def predict_diffusion_vector(
             self, noise_x: Tensor, cond_x: Dict[str, Tensor], time: Tensor, mode: str,
@@ -1004,6 +1088,7 @@ class EveNetModel(nn.Module):
             train_parameters: Union[dict, None],
             schedules: Union[list[tuple[str, bool]], None] = None,
             return_pair_states: bool = False,
+            num_recycles: Optional[int] = None,
     ) -> dict:
         time = torch.rand((batch_size,), device=batch['x'].device, dtype=batch['x'].dtype)
         output = self.forward(
@@ -1012,6 +1097,7 @@ class EveNetModel(nn.Module):
             progressive_params=train_parameters,
             schedules=schedules,
             return_pair_states=return_pair_states,
+            num_recycles=num_recycles,
         )
         return output
 

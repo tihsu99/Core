@@ -481,7 +481,8 @@ class PETBody(nn.Module):
                 attn_mask: Optional[Tensor]=None,
                 time_masking: Optional[Tensor]=None,
                 local_mask: Optional[Tensor]=None,
-                return_pair_states: bool = False
+                return_pair_states: bool = False,
+                pair_hypothesis: Optional[Tensor] = None,
                 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         """
 
@@ -549,7 +550,15 @@ class PETBody(nn.Module):
             static_attention_bias = self.simple_pair_bias(pair_representation, pair_mask)
         elif self.attention_bias_type == "IterativeUpdate":
             pair_representation = self.pair_embedding(pair_representation, pair_mask)
+            if pair_hypothesis is not None:
+                if pair_hypothesis.shape != pair_representation.shape:
+                    raise ValueError("Pair hypothesis must match the embedded pair representation")
+                pair_representation = pair_representation + pair_hypothesis.masked_fill(
+                    ~pair_mask[..., None], 0
+                )
             pair_input = pair_representation if return_pair_states else None
+        if pair_hypothesis is not None and self.attention_bias_type != "IterativeUpdate":
+            raise ValueError("Pair hypotheses require PET.attention_bias_type='IterativeUpdate'")
 
         time = time.unsqueeze(1).unsqueeze(1).repeat(1, encoded.shape[1], 1)
         if time_masking is not None:

@@ -10,6 +10,8 @@ from evenet.network.layers.transformer import ClassifierTransformerBlockModule
 from typing import Optional
 
 from evenet.network.layers.transformer import SegmentationTransformerBlockModule
+from evenet.network.layers.transformer import TransformerBlockModule
+from evenet.network.body.pairformer import PairToAttentionBias
 
 """
 Segmentation Transformer Head modified from Mask2Former
@@ -220,6 +222,9 @@ class SegmentationHead(nn.Module):
             return_intermediate: bool = False,
             norm_before: bool = True,
             encode_event_token: bool = False,
+            use_pair_representation: bool = False,
+            pair_dim: Optional[int] = None,
+            pair_attention_config: Optional[dict] = None,
     ):
         super(SegmentationHead, self).__init__()
 
@@ -271,6 +276,27 @@ class SegmentationHead(nn.Module):
         self.class_embed = nn.Linear(projection_dim, num_class + 1)  # Binary classification for mask prediction
         self.mask_embed = MLP(projection_dim, projection_dim, mask_dim, num_mask_mlp_layers)
 
+        self.use_pair_representation = use_pair_representation
+        self.pair_dim = pair_dim
+        if use_pair_representation:
+            if pair_dim is None or pair_dim < 1:
+                raise ValueError("Segmentation pair_dim must be positive when using pair representations")
+            pair_cfg = pair_attention_config or {}
+            num_pair_layers = int(pair_cfg.get("num_layers", 1))
+            if num_pair_layers < 1:
+                raise ValueError("Segmentation.pair_attention.num_layers must be positive")
+            self.pair_attention_bias = PairToAttentionBias(pair_dim, num_heads)
+            self.pair_attention_blocks = nn.ModuleList([
+                TransformerBlockModule(
+                    projection_dim=projection_dim, num_heads=num_heads, dropout=dropout,
+                    talking_head=bool(pair_cfg.get("talking_head", False)),
+                    layer_scale=bool(pair_cfg.get("layer_scale", True)),
+                    layer_scale_init=float(pair_cfg.get("layer_scale_init", 1.0e-5)),
+                    drop_probability=float(pair_cfg.get("drop_probability", 0.0)),
+                    norm_type=pair_cfg.get("norm_type", "DynamicTanh"),
+                ) for _ in range(num_pair_layers)
+            ])
+
         # Encode event token
         self.encode_event_token = encode_event_token
         if encode_event_token:
@@ -284,7 +310,8 @@ class SegmentationHead(nn.Module):
     def forward(self, memory, memory_mask,
                 pos_embed: Optional[Tensor] = None,
                 event_token: Optional[Tensor] = None,
-
+                pair_state: Optional[Tensor] = None,
+                pair_mask: Optional[Tensor] = None,
                 **kwargs
                 ):
         """
@@ -295,8 +322,33 @@ class SegmentationHead(nn.Module):
         """
 
         batch_size, num_patches, projection_dim = memory.shape
+        if self.use_pair_representation:
+            if pair_state is None or pair_mask is None or memory_mask is None:
+                raise ValueError("Segmentation requires final pair states and object/pair masks")
+            if pair_state.shape != (batch_size, num_patches, num_patches, self.pair_dim):
+                raise ValueError("Segmentation pair_state must have shape [B, N, N, pair_dim]")
+            if pair_mask.shape != (batch_size, num_patches, num_patches):
+                raise ValueError("Segmentation pair_mask must have shape [B, N, N]")
+            if memory_mask.shape != (batch_size, num_patches, 1):
+                raise ValueError("Segmentation memory_mask must have shape [B, N, 1]")
+            objects_valid = memory_mask.squeeze(-1).bool()
+            memory = memory.masked_fill(~objects_valid[..., None], 0)
+            valid = pair_mask.bool() & objects_valid[:, :, None] & objects_valid[:, None, :]
+            valid = valid & ~torch.eye(num_patches, dtype=torch.bool, device=memory.device)[None]
+            bias = self.pair_attention_bias(
+                pair_state.masked_fill(~valid[..., None], 0), valid
+            )
+            pair_memory = memory
+            for block in self.pair_attention_blocks:
+                pair_memory = block(pair_memory, mask=memory_mask, attn_bias=bias)
+            memory = torch.where(valid.any(dim=(1, 2))[:, None, None], pair_memory, memory)
         padding_mask = ~(
             memory_mask.squeeze(-1).bool()) if memory_mask is not None else None  # (batch_size, num_patches)
+        attention_padding_mask = None
+        if self.use_pair_representation:
+            attention_padding_mask = padding_mask.clone()
+            # Give empty events one zero-valued key so MultiheadAttention stays finite.
+            attention_padding_mask[padding_mask.all(-1), 0] = False
 
         predictions_class = []
         predictions_mask = []
@@ -318,7 +370,7 @@ class SegmentationHead(nn.Module):
             output = self.transformer_cross_attention_layers[i](
                 tgt=output,
                 memory=memory,
-                memory_key_padding_mask=None,
+                memory_key_padding_mask=attention_padding_mask,
                 pos=pos_embed,
                 query_pos=query_embed,
                 memory_mask=attn_mask
